@@ -14,7 +14,7 @@ description = ('Metabolomics Variational Autoencoders.')
 
 
 setup(name='metvae',
-      version='0.0.1',
+      version='0.0.2',
       description=description,
       long_description=open("README.md").read(),
       long_description_content_type="text/markdown",

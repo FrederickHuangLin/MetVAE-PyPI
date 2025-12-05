@@ -21,7 +21,7 @@ def test_metvae_cli_outputs(test_files):
         '--latent_dim', '100',
         '--batch_size', '100',
         '--learning_rate', '0.01',
-        '--alpha_grid', '0', '0.0001'
+        '--sparse_method', 'pval'
     ]
     
     try:
@@ -29,14 +29,14 @@ def test_metvae_cli_outputs(test_files):
         subprocess.run(command, check=True, capture_output=True, text=True)
         
         # Check if files exist
-        assert os.path.exists('df_corr.csv'), "Correlation matrix file was not created"
+        assert os.path.exists('df_sparse_pval.csv'), "Sparse correlation matrix file was not created"
         assert os.path.exists('model_state.pth'), "Model state file was not created"
         
     except subprocess.CalledProcessError as e:
         pytest.fail(f"CLI command failed with error: {e.stderr}")
     finally:
         # Clean up created files after testing
-        for file in ['df_corr.csv', 'model_state.pth']:
+        for file in ['df_sparse_pval.csv', 'model_state.pth']:
             if os.path.exists(file):
                 os.remove(file)
 

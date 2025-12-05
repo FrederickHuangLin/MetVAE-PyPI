@@ -1,1 +1,1 @@
-from .model import MetVAE, MetIWAEfrom .sim import sim_data__version__ = "0.0.1"
+from .model import MetVAEfrom .sim import sim_data__version__ = "0.0.2"

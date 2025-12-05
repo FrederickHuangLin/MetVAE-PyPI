@@ -15,9 +15,6 @@ def test_vae(sample_metabolomics_data):
     data = simulation['abundance_data']
     meta = simulation['meta_data']
     true_cor = simulation['true_cor']
-    
-    torch.manual_seed(123)
-    np.random.seed(123)
 
     max_epochs=1000
     learning_rate=1e-2
@@ -37,10 +34,9 @@ def test_vae(sample_metabolomics_data):
     
     model.get_corr(num_sim=1000)
     
-    # Thresholding
-    random.seed(123)
-    results_metvae = model.sparse_by_thresholding(th_len=100, n_cv=5, soft=False, n_jobs=1)
-    est_cor = results_metvae['sparse_estimate']
+    # Filtering
+    results_metvae = model.sparse_by_p(p_adj_method='fdr_bh', cutoff=0.05)
+    est_cor = results_metvae['sparse_estimate'].values
 
     # Calculate summary statistics
     true_idx = true_cor[np.tril_indices_from(true_cor, k=-1)] != 0
@@ -49,9 +45,9 @@ def test_vae(sample_metabolomics_data):
     fpr = np.sum(est_idx & ~true_idx) / np.sum(~true_idx)
     fdr = np.sum(est_idx & ~true_idx) / np.sum(est_idx)
     
-    assert tpr == 0.9
-    assert fpr == 0.0
-    assert fdr == 0.0
+    assert round(tpr, 4) == np.float64(0.9000)
+    assert round(fpr, 4) == np.float64(0.0008)
+    assert round(fdr, 4) == np.float64(0.1000)
     
     
     

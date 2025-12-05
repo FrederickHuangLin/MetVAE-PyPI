@@ -1,14 +1,17 @@
 # MetVAE: A Variational Autoencoder for Metabolomics Correlation Analysis
 
-MetVAE is a specialized Python package that implements a Variational Autoencoder (VAE) specifically designed for metabolomics correlation analysis. It addresses key challenges in metabolomics data, especially in untargeted metabolomics, including compositionality, missing values, and the influence of covariates or confounders.
+MetVAE is a variational autoencoder (VAE) framework for untargeted metabolomics data with:
 
-## Key Features
+- Compositional (CLR) preprocessing with zero/censoring handling
+- Covariate/confounder adjustment
+- Multiple-imputation–based correlation estimation
+- Two sparsification strategies:
+  - `sparse_by_p`: p-value based sparsification (Fisher’s z + multiple testing correction)
+  - `sparse_by_sec`: Sparse Estimation of Correlation (SEC) with optional CV-based `rho` selection
 
-- **Compositionality-Aware**: Automatically handles compositional data through centered log-ratio (CLR) transformation
-- **Smart Zero Handling**: Uses censored estimation and multiple imputation for values below detection limit
-- **Covariate/Confounder Adjustment**: Removes unwanted variation from experimental and biological covariates or confounders
-- **Sparse Correlation Analysis**: Provides statistical and data-driven methods to construct a sparsified correlation matrix for metabolites
-- **Latent Space Analysis**: Enables exploration of underlying metabolic patterns and modules
+The package can be used either as a Python API or via the command-line interface (`metvae-cli`).
+
+------
 
 ## Installation
 
@@ -16,285 +19,328 @@ MetVAE is a specialized Python package that implements a Variational Autoencoder
 pip install metvae
 ```
 
-## Quick Start
+(If you’re working from source, you can install with:)
 
-Here's a simple example to get you started:
+```bash
+pip install -e .
+```
+
+------
+
+## Basic Python Usage
+
+### 1. Prepare data
 
 ```python
-from metvae import MetVAE
+import pandas as pd
+from metvae.model import MetVAE
 
-# Initialize and fit the model
+# data: samples x metabolites
+data = pd.read_csv("data.csv", index_col=0)
+
+# meta: optional sample metadata (rows = samples)
+meta = pd.read_csv("meta.csv", index_col=0)
+```
+
+### 2. Initialize the model
+
+```python
 model = MetVAE(
-    data=abundance_data,
-    meta=meta_data,
-    continuous_covariate_keys=['age', 'bmi'],
-    categorical_covariate_keys=['sex', 'batch'],
-    latent_dim=10
-)
-
-# Train the model
-model.train(max_epochs=1000)
-
-# Analyze correlations
-correlations = model.get_corr(num_sim=1000)
-
-# Create sparse network
-sparse_network = model.sparse_by_thresholding(
-    th_len=30,
-    n_cv=5,
-    soft=False
+    data=data,
+    features_as_rows=False,          # set True if features are rows
+    meta=meta,
+    continuous_covariate_keys=["age", "bmi"],
+    categorical_covariate_keys=["sex", "batch"],
+    latent_dim=10,
+    use_gpu=True,                    # use CUDA if available
+    seed=0
 )
 ```
 
-## Detailed Usage
-
-### Data Preprocessing
-
-The package automatically handles several preprocessing steps:
-
-1. **CLR Transformation**: Addresses the compositional nature of metabolomics data
-2. **Zero Value Processing**: Uses sophisticated methods to handle measurements below detection limit
-3. **Covariate/Confounder Adjustment**: Removes unwanted variation from known confounding factors
-
-### Correlation Analysis
-
-MetVAE provides multiple approaches for analyzing metabolite relationships:
+### 3. Train
 
 ```python
-# Compute correlations with multiple imputation
-model.get_corr(num_sim=1000)
+model.train(
+    batch_size=128,
+    num_workers=0,
+    max_epochs=1000,
+    learning_rate=1e-3,
+    log_every_n_steps=1
+)
+```
 
-# Create sparse network using statistical filtering
-sparse_stats = model.sparse_by_filter(
+------
+
+## Correlation Estimation
+
+All sparsification methods rely on a **correlation estimate** produced via repeated imputations of censored zeros.
+
+### `get_corr`
+
+```python
+corr_outputs = model.get_corr(
+    num_sim=100,
+    workers=-1,          # CPU workers (ignored on GPU)
+    batch_size=100,      # batch size for GPU imputation
+    threshold=0.2,       # |r| threshold inside _compute_correlation
+    seed=0               # base seed; uses seed + sim_id internally
+)
+```
+
+This computes:
+
+- Multiple imputations of the CLR/log data using the trained VAE
+- Back-transforms to the original scale
+- Computes a **sparse** correlation matrix using `_compute_correlation` + a hard correlation threshold
+
+The result is stored in:
+
+```python
+model.corr_outputs  # dict with:
+# 'impute_log_data' : mean imputed log-data (dense tensor)
+# 'estimate'        : sparse correlation matrix (COO tensor)
+```
+
+------
+
+## Sparsification Method 1: `sparse_by_p` (p-value based)
+
+`MetVAE.sparse_by_p` takes the correlation estimate in `self.corr_outputs['estimate']` and performs Fisher’s z-test with multiple testing correction, then zeroes out non-significant edges.
+
+### API
+
+```python
+model.sparse_by_p(
     p_adj_method='fdr_bh',
     cutoff=0.05
 )
+```
 
-# Create sparse network using threshold optimization
-sparse_thresh = model.sparse_by_thresholding(
-    th_len=30,
-    n_cv=5
+### Parameters
+
+- **`p_adj_method`**: multiple testing correction method passed to `_matrix_p_adjust`, options include
+   `'bonferroni', 'sidak', 'holm-sidak', 'holm', 'simes-hochberg', 'hommel',  'fdr_bh', 'fdr_by', 'fdr_tsbh', 'fdr_tsbky'` (default `'fdr_bh'`).
+- **`cutoff`**: threshold on *adjusted* p-values; correlations with `q_value > cutoff` are set to zero.
+
+### Returns
+
+```python
+results_p = model.sparse_by_p()
+```
+
+`results_p` is a dictionary with:
+
+- `'estimate'` – **dense** correlation matrix (DataFrame)
+- `'p_value'` – unadjusted p-values (DataFrame)
+- `'q_value'` – adjusted p-values (DataFrame)
+- `'sparse_estimate'` – sparsified correlation matrix (DataFrame) with non-significant entries zeroed
+
+Example:
+
+```python
+results_p = model.sparse_by_p(p_adj_method="fdr_bh", cutoff=0.05)
+sparse_corr_p = results_p["sparse_estimate"].values
+```
+
+> ⚠️ `sparse_by_p` assumes `model.get_corr()` has already been called; otherwise it raises a `ValueError`.
+
+------
+
+## Sparsification Method 2: `sparse_by_sec` (SEC)
+
+`sparse_by_sec` uses the **Sparse Estimation of Correlation (SEC)** algorithm to obtain a sparse correlation matrix. It can either:
+
+1. **Fit once** with a fixed `rho` if you pass `rho`, or
+2. **Select `rho` automatically** via K-fold cross-validation when `rho=None`.
+
+The Python implementation in this package is adapted from the original [MATLAB reference code](https://warwick.ac.uk/fac/sci/statistics/staff/academic-research/leng/publications/sec.m) by Leng's lab.
+
+### API
+
+```python
+results_sec = model.sparse_by_sec(
+    rho=None,
+    # SEC solver hyperparameters
+    epsilon=1e-5,
+    tol=1e-3,
+    max_iter=1000,
+    restart=50,
+    line_search_apg=True,
+    delta=None,
+    n_samples=None,
+    c_delta=0.1,
+    threshold=0.1,
+    # CV settings (used only when rho is None)
+    c_grid=tuple(float(x) for x in range(1, 11)),  # 1.0, 2.0, ..., 10.0
+    n_splits=5,
+    seed=0,
+    workers=-1,          # CPU: parallel across rho; GPU / workers<=1: sequential
+    refine=True,         # single zoom after coarse pass
+    refine_points=10
 )
 ```
 
-### Latent Space Analysis
+### Behavior
 
-Explore the patterns learned by the model:
+- If **`rho` is provided** (`rho=2.2`, say):
+
+  - `sparse_by_sec` calls `_SEC` once on `model.corr_outputs['estimate']` and returns that fit.
+  - No cross-validation is performed.
+  - `scores_by_rho` is set to `None`.
+
+- If **`rho` is `None`**:
+
+  - Candidate penalties are given by 
+    $$
+    \rho = c \cdot \sqrt{\log(p)/n}
+    $$
+    
+
+
+     for `c` in `c_grid`, where `p` = number of features and `n` = number of samples.
+
+  - A K-fold (default 5-fold) CV loop:
+
+    - For each `rho`, fits SEC on the training subset correlation
+    - Computes the mean squared Frobenius error between the SEC estimate and the empirical correlation on validation subsets
+
+  - After the coarse pass:
+
+    - If `refine=True`, it **refines once** in a bracket between the best coarse `c` and its immediate left/right neighbors using `refine_points` equally spaced `c` values.
+
+  - The final `best_rho` is the one with the smallest mean validation error (tie-broken by smaller `rho`).
+
+### Outputs
 
 ```python
-# Get feature loadings in CLR space
-loadings = model.clr_loading()
-
-# Compute metabolite co-occurrence patterns
-cooccurrence = model.cooccurrence()
+results_sec = model.sparse_by_sec(rho=None)
 ```
 
-## Advanced Features
+`results_sec` is a dictionary with:
 
-### Customizing Network Sparsification
+- `'estimate'` – **dense** empirical correlation matrix before SEC (DataFrame)
 
-The package offers two main approaches to network sparsification:
+- `'sparse_estimate'` – final **dense** SEC estimate after thresholding (DataFrame)
 
-1. **Statistical Filtering**: Uses Fisher's z-test with multiple testing correction to control false discoveries
-   
-   ```python
-   sparse_stats = model.sparse_by_filter(
-       p_adj_method='fdr_bh',  # Benjamini-Hochberg FDR control
-       cutoff=0.05
-   )
-   ```
-   
-2. **Threshold Optimization**: Uses cross-validation to find optimal sparsity levels
-   ```python
-   sparse_thresh = model.sparse_by_thresholding(
-       th_len=30,  # Number of thresholds to test
-       n_cv=5,     # Number of cross-validation folds
-       soft=False  # Use hard thresholding
-   )
-   ```
+- `'best_rho'` – the selected `rho` (or your supplied `rho` if you passed one)
 
-### Handling Covariates
+- `'scores_by_rho'` –
 
-MetVAE can adjust for both continuous and categorical covariates:
+  - If you passed `rho` explicitly → `None`
+
+  - If `rho=None` → a **pandas DataFrame** with one row per evaluated candidate:
+
+    | c    | rho                | score                         |
+    | ---- | ------------------ | ----------------------------- |
+    | …    | c * sqrt(log(p)/n) | mean validation Frobenius err |
+
+Values are sorted by `rho` (stable sort), which makes plotting easy:
 
 ```python
-model = MetVAE(
-    data=metabolite_data,
-    meta=metadata,
-    continuous_covariate_keys=['age', 'bmi'],
-    categorical_covariate_keys=['sex', 'batch', 'treatment'],
-    latent_dim=10
+scores = results_sec["scores_by_rho"]
+scores.plot(x="rho", y="score", marker="o")
+```
+
+Example usage with fixed `rho`:
+
+```python
+# After model.get_corr(...)
+results_sec = model.sparse_by_sec(rho=2.2)
+sparse_corr_sec = results_sec["sparse_estimate"].values
+```
+
+Example with automatic `rho` selection:
+
+```python
+results_sec = model.sparse_by_sec(
+    rho=None,
+    c_grid=tuple(float(x) for x in range(1, 11)),
+    n_splits=5,
+    seed=0,
+    workers=-1,
+    refine=True,
+    refine_points=10
 )
+
+best_rho = results_sec["best_rho"]
+scores_df = results_sec["scores_by_rho"]
+sparse_corr_sec = results_sec["sparse_estimate"].values
 ```
 
-### Command Line Usage
+------
 
-The MetVAE package provides a command-line interface for easy model training and analysis. Here's an example showing how to train a model with both continuous and categorical covariates:
+## Command Line Interface (`metvae-cli`)
+
+The CLI mirrors the Python API:
 
 ```bash
 metvae-cli \
---data test_data.csv \
---meta test_smd.csv \
---continuous_covariate_keys x1 \
---categorical_covariate_keys x2 \
---latent_dim 100 \
---use_gpu \
---logging \
---batch_size 100 \
---learning_rate 0.01 \
---alpha_grid 0 0.0001
+  --data data_miss.csv \
+  --meta meta.csv \
+  --continuous_covariate_keys age bmi \
+  --categorical_covariate_keys sex batch \
+  --latent_dim 10 \
+  --batch_size 128 \
+  --max_epochs 1000 \
+  --learning_rate 0.001 \
+  --num_sim 100 \
+  --corr_threshold 0.2 \
+  --sparse_method pval \
+  --p_adj_method fdr_bh \
+  --cutoff 0.05
 ```
 
-For a complete list of available parameters and their descriptions, run:
+To use SEC instead of p-value filtering:
 
 ```bash
-metvae-cli --help
+metvae-cli \
+  --data data_miss.csv \
+  --meta meta.csv \
+  --continuous_covariate_keys age bmi \
+  --categorical_covariate_keys sex batch \
+  --latent_dim 10 \
+  --batch_size 128 \
+  --max_epochs 1000 \
+  --learning_rate 0.001 \
+  --num_sim 100 \
+  --corr_threshold 0.2 \
+  --sparse_method sec \
+  --rho 2.2
 ```
 
-## Technical Details
+If you want automatic `rho` selection, use the CLI flags that correspond to the SEC hyperparameters (e.g., `--sec-epsilon`, `--sec-tol`, `--sec-c-grid`, `--sec-n-splits`, etc.), which map directly onto the `sparse_by_sec` parameters described above.
 
-- **Data Format**: Expects pandas DataFrames with samples as either rows or columns
-- **Missing Values**: Automatically handles zero values through sophisticated imputation
-- **GPU Support**: Optional GPU acceleration for model training
-- **Parallel Processing**: Supports multi-core processing for computational efficiency
+------
 
-# A Complete Simulation Example
+## Zero Imputation / Reconstruction
 
-This example demonstrates how to implement MetVAE utilizing a synthetic dataset.
-
-## Setup and Data Generation
+If you just want to impute censored zeros using the trained VAE:
 
 ```python
-import random
-import numpy as np
-import pandas as pd
-import torch
-from metvae.model import MetVAE
-from metvae.sim import sim_data
-
-# Initialize parameters
-n, d, zero_prop, seed = 100, 50, 0.3, 123
-# n: number of samples
-# d: number of features
-# zero_prop: proportion of zeros to introduce
-# seed: random seed for reproducibility
-
-# Set up correlation parameters
-cor_pairs = int(0.2 * d)     # Number of correlated feature pairs (20% of features)
-mu = list(range(10, 15))     # Mean values for data generation
-da_prop = 0.1                # Differential abundance proportion
-
-# Create sample metadata with continuous and categorical covariates
-np.random.seed(seed)
-smd = pd.DataFrame({
-    'x1': np.random.randn(n),                           # Continuous covariate
-    'x2': np.random.choice(['a', 'b'], size=n, replace=True)  # Categorical covariate
-})
-smd.index = ["s" + str(i) for i in range(n)]
-
-# Generate correlated data using sim_data function
-sim = sim_data(n=n, d=d, cor_pairs=cor_pairs, mu=mu, x=smd, 
-               cont_list=['x1'], cat_list=['x2'], da_prop=da_prop)
-y = sim['y']           # Original absolute abundance data
-x = sim['x']           # Covariates
-true_cor = sim['cor_matrix']  # True correlation matrix
-beta = sim['beta']     # True regression coefficients
-
-# Apply transformations and introduce biases
-log_y = np.log(y)
-log_sample_bias = np.log(np.random.uniform(1e-3, 1e-1, size=n))    # Sample-specific bias
-log_feature_bias = np.log(np.random.uniform(1e-1, 1, size=d))      # Feature-specific bias
-log_data = log_y + log_sample_bias[:, np.newaxis]  
-log_data = log_data + log_feature_bias.reshape(1, d)  
-data = np.exp(log_data)
-
-# Introduce missing values (zeros) based on quantile thresholds
-thresholds = np.quantile(data, zero_prop, axis=0)
-data_miss = np.where(data < thresholds, 0, data)
-data_miss = pd.DataFrame(data_miss, index=y.index, columns=y.columns)
+imputed_clr = model.impute_zeros()
 ```
 
-## Model Training and Evaluation
+This:
+
+1. Initializes censored values by sampling from a censored Gaussian (per feature),
+2. Refines them using the VAE decoder,
+3. Returns a fully-imputed CLR matrix.
+
+------
+
+## Coefficients and Confounding Effects
 
 ```python
-# Train MetVAE model
-torch.manual_seed(123)
-np.random.seed(123)
-max_epochs = 1000
-learning_rate = 1e-2
-
-# Initialize model with metadata
-model = MetVAE(data=data_miss,
-               features_as_rows=False,
-               meta=smd,
-               continuous_covariate_keys=['x1'],
-               categorical_covariate_keys=['x2'],
-               latent_dim=min(n, d))
-
-# Train the model
-model.train(batch_size=100,
-            num_workers=0,
-            max_epochs=max_epochs,
-            learning_rate=learning_rate,
-            log_every_n_steps=1)
-
-# Obtain the sparse correlation matrix by p-value filtering
-model.get_corr(num_sim=1000)
-results_metvae = model.sparse_by_filter(p_adj_method='fdr_bh', cutoff=0.05)
-est_cor = results_metvae['sparse_estimate']
-
-# Calculate performance metrics
-true_idx = true_cor[np.tril_indices_from(true_cor, k=-1)] != 0
-est_idx = est_cor[np.tril_indices_from(est_cor, k=-1)] != 0
-tpr = np.sum(est_idx & true_idx) / np.sum(true_idx)      # True Positive Rate
-fpr = np.sum(est_idx & ~true_idx) / np.sum(~true_idx)    # False Positive Rate
-fdr = np.sum(est_idx & ~true_idx) / np.sum(est_idx)      # False Discovery Rate
-
-# Obtain the sparse correlation matrix by thresholding
-random.seed(123)
-results_metvae = model.sparse_by_thresholding(th_len=100, n_cv=5, soft=False, n_jobs=1)
-est_cor = results_metvae['sparse_estimate']
-
-# Calculate performance metrics for thresholding approach
-true_idx = true_cor[np.tril_indices_from(true_cor, k=-1)] != 0
-est_idx = est_cor[np.tril_indices_from(est_cor, k=-1)] != 0
-tpr = np.sum(est_idx & true_idx) / np.sum(true_idx)
-fpr = np.sum(est_idx & ~true_idx) / np.sum(~true_idx)
-fdr = np.sum(est_idx & ~true_idx) / np.sum(est_idx)
+coef_df = model.confound_coef()  # covariate x metabolite effects (if meta was provided)
+es_df   = model.confound_es()    # sample x metabolite confounding effects
 ```
 
-## Results
+------
+
+## Latent Loadings and Co-occurrence
 
 ```python
-# P-value filtering results
-tpr =  0.9  
-fpr =  0.0 
-fdr =  0.0  
-
-# Thresholding results
-tpr =  0.9
-fpr =  0.0
-fdr =  0.0
+loading_df = model.clr_loading()   # feature loadings on latent dims
+cooccur_df = model.cooccurrence()  # co-occurrence matrix between features
 ```
 
-## Citation
-
-If you use MetVAE in your research, please cite:
-
-[Paper in Preparation]
-
-## Contributing
-
-We welcome contributions! Please feel free to submit a Pull Request.
-
-## License
-
-This package is licensed under the MIT License - see the LICENSE file for details.
-
-## Contact
-
-Huang Lin
-
-Email: hlin1239@umd.edu
-
-GitHub: https://github.com/FrederickHuangLin/MetVAE-PyPI/issues

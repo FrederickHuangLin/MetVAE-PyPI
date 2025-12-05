@@ -1,102 +1,201 @@
+import os
 import argparse
-import random
-import numpy as np
 import pandas as pd
 import torch
-from .model import MetIWAE, MetVAE
+from .model import MetVAE
 
 def main():
-    # Create the argument parser
-    arg_parser = argparse.ArgumentParser(description='Run MetVAE')
+    # ---- Argument parser ----
+    parser = argparse.ArgumentParser(description='Run MetVAE correlation + sparsification')
 
-    # Define arguments
-    arg_parser.add_argument('--seed', type=int, help='Set a random seed for reproducibility', default=123)
-    arg_parser.add_argument('--model', type=str, help='Select either the VAE or IWAE model', default='VAE')
-    arg_parser.add_argument('--data', type=str, help='Path to the metabolic abundance file (CSV). The index column should be the first column.', required=True)
-    arg_parser.add_argument('--features_as_rows', action='store_true', help='Use if features are in rows and samples in columns (default: features in columns)')
-    arg_parser.add_argument('--meta', type=str, help='Path to the sample meta file (CSV). The index column should be the first column.', default=None)
-    arg_parser.add_argument('--continuous_covariate_keys', nargs='+', type=str, help='Names of continuous covariates', default=[])
-    arg_parser.add_argument('--categorical_covariate_keys', nargs='+', type=str, help='Names of categorical covariates', default=[])
-    arg_parser.add_argument('--latent_dim', type=int, help='Set the dimension of laten variables', default=100)
-    arg_parser.add_argument('--num_importance_samples', type=int, help='Set the number of importance samples to generate.', default=1)
-    arg_parser.add_argument('--use_gpu', action='store_true', help='Enable GPU acceleration (default: CPU only)')
-    arg_parser.add_argument('--logging', action='store_true', help='Enable debug logging (default: disabled)')
-    arg_parser.add_argument('--batch_size', type=int, help='Number of samples per batch during training', default=32)
-    arg_parser.add_argument('--num_workers', type=int, help='Number of worker threads for data loading', default=0)
-    arg_parser.add_argument('--max_epochs', type=int, help='Maximum number of training epochs', default=1000)
-    arg_parser.add_argument('--learning_rate', type=float, help='Learning rate for the optimizer', default=0.001)
-    arg_parser.add_argument('--th_len', type=int, help='Number of threshold values to test', default=30)
-    arg_parser.add_argument('--n_cv', type=int, help='Number of cross-validation folds', default=5)
-    arg_parser.add_argument('--soft', action='store_true', help='Use soft thresholding instead of hard (default: hard)')
-    arg_parser.add_argument('--alpha_grid', nargs='+', type=float, help='Custom grid of sparsity penalty parameters to test', default=[0.0])
-    arg_parser.add_argument('--n_jobs', type=int, help='The maximum number of concurrently running jobs', default=None)
-    arg_parser.add_argument('--save_path', type=str, help='Path to save the outputs', default='./')
+    # Reproducibility & IO
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--data', type=str, required=True,
+                        help='Path to abundance CSV (index = samples, columns = features; use --features_as_rows if transposed)')
+    parser.add_argument('--features_as_rows', action='store_true',
+                        help='If set, features are rows and samples are columns in the input CSV')
+    parser.add_argument('--meta', type=str, default=None,
+                        help='Optional CSV with sample-level covariates (index must match samples)')
+    parser.add_argument('--save_path', type=str, default='./', help='Output directory prefix')
 
-    # Parse the arguments
-    args = arg_parser.parse_args()
+    # Covariates & model size
+    parser.add_argument('--continuous_covariate_keys', nargs='+', type=str, default=[],
+                        help='Names of continuous covariates in meta')
+    parser.add_argument('--categorical_covariate_keys', nargs='+', type=str, default=[],
+                        help='Names of categorical covariates in meta')
+    
+    # Model architecture
+    parser.add_argument("--latent_dim", type=int, default=10, help="Latent dimension")
+    parser.add_argument("--hidden_dims", nargs="*", type=int, default=None,
+                        help="Encoder hidden layer sizes, e.g. --hidden_dims 256 128. Omit for linear.")
+    parser.add_argument("--activation", type=str, default="relu",
+                        choices=["relu", "tanh", "gelu", "silu", "linear", "none"],
+                        help="Activation for MLP layers. 'linear'/'none' means no nonlinearity.")
 
-    # Main code
-    # Input data
+    # Device & logging
+    parser.add_argument('--use_gpu', action='store_true', help='Use CUDA if available')
+    parser.add_argument('--logging', action='store_true', help='Enable debug logging')
+
+    # Training hyperparameters
+    parser.add_argument('--batch_size', type=int, default=128, help='Training batch size')
+    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
+    parser.add_argument('--max_epochs', type=int, default=1000, help='Max training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='Optimizer learning rate')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                        help='Clip grad norm to this value; set to -1 to disable')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='Enable deterministic cuDNN/algorithms (may reduce speed)')
+
+    # Correlation estimation (multiple imputation)
+    parser.add_argument('--num_sim', type=int, default=100, help='Number of imputations')
+    parser.add_argument('--workers', type=int, default=-1,
+                        help='CPU workers for imputation (ignored on GPU); -1 = all cores')
+    parser.add_argument('--threshold', type=float, default=0.2,
+                        help='Correlation sparsity threshold used inside correlation estimation')
+    parser.add_argument('--impute_batch_size', type=int, default=100,
+                        help='GPU batch size for imputation (only used on CUDA)')
+
+    # Sparsification method
+    parser.add_argument('--sparse_method', type=str, default='sec',
+                        choices=['pval', 'sec'],
+                        help='Choose p-value filtering or SEC algorithm')
+
+    # (A) Filtering options
+    parser.add_argument('--p_adj_method', type=str, default='fdr_bh',
+                        choices=['bonferroni', 'sidak', 'holm-sidak', 'holm', 'simes-hochberg',
+                                 'hommel', 'fdr_bh', 'fdr_by', 'fdr_tsbh', 'fdr_tsbky'],
+                        help='Multiple testing correction for filtering')
+    parser.add_argument('--cutoff', type=float, default=0.05,
+                        help='Adjusted p-value cutoff for filtering')
+
+    # (B) SEC options
+    parser.add_argument('--rho', type=float, default=-1.0,
+                        help='Fixed L1 penalty. Use a negative value (default) to enable CV selection')
+    parser.add_argument('--sec_epsilon', type=float, default=1e-5, help='PSD floor epsilon')
+    parser.add_argument('--sec_tol', type=float, default=1e-3, help='APG convergence tolerance')
+    parser.add_argument('--sec_max_iter', type=int, default=1000, help='Max APG iterations')
+    parser.add_argument('--sec_restart', type=int, default=50,
+                        help='Nesterov restart period; set <0 to disable')
+    parser.add_argument('--no_line_search_apg', action='store_true',
+                        help='Disable APG backtracking (line search)')
+    parser.add_argument('--sec_delta', type=float, default=None,
+                        help='Tiny-entry cutoff δ; None => c_delta*sqrt(log p / n)')
+    parser.add_argument('--sec_c_delta', type=float, default=0.1, help='Scale for δ')
+    parser.add_argument('--sec_threshold', type=float, default=0.1,
+                        help='Final hard threshold applied to SEC result')
+    parser.add_argument('--c_grid', nargs='+', type=float,
+                        default=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+                        help='Coarse grid multipliers c for CV: rho = c * sqrt(log(p)/n)')
+    parser.add_argument('--n_splits', type=int, default=5,
+                        help='K-fold CV splits for rho selection')
+    parser.add_argument('--no_refine', action='store_true',
+                        help='Disable the single zoom-in refinement after coarse CV')
+    parser.add_argument('--refine_points', type=int, default=10, 
+                        help='Number of points in the refinement bracket (inclusive)')
+    parser.add_argument('--sec_workers', type=int, default=-1,
+                        help='CPU workers for CV; -1 = all cores (GPU or <=1 runs sequentially)')
+
+    args = parser.parse_args()
+
+    # ---- Load data ----
     data = pd.read_csv(args.data, index_col=0)
-
     if args.features_as_rows:
         data = data.T
+    meta = None if args.meta is None else pd.read_csv(args.meta, index_col=0)
     
-    feature_name = data.columns.tolist()
-
-    if args.meta is None:
-        meta = None
-    else:
-        meta = pd.read_csv(args.meta, index_col=0)
-
-    # Run the VAE/IWAE model
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    
-    if args.model == 'VAE':
-        model = MetVAE(data=data,
-                       meta=meta,
-                       continuous_covariate_keys=args.continuous_covariate_keys,
-                       categorical_covariate_keys=args.categorical_covariate_keys,
-                       latent_dim=args.latent_dim,
-                       use_gpu=args.use_gpu,
-                       logging=args.logging)
-    else:
-        model = MetIWAE(data=data,
-                        meta=meta,
-                        continuous_covariate_keys=args.continuous_covariate_keys,
-                        categorical_covariate_keys=args.categorical_covariate_keys,
-                        latent_dim=args.latent_dim,
-                        num_importance_samples=args.num_importance_samples,
-                        use_gpu=args.use_gpu,
-                        logging=args.logging)
-    
-    model.train(batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                max_epochs=args.max_epochs,
-                learning_rate=args.learning_rate,
-                log_every_n_steps=1)
-
-    # Save the model state
-    torch.save(model.model.state_dict(), args.save_path + 'model_state.pth')
-    
-    # Obtain correlations
-    model.get_corr(num_sim=1000)
-    random.seed(args.seed)
-    results = model.sparse_by_thresholding(th_len=args.th_len, 
-                                           n_cv=args.n_cv, 
-                                           soft=args.soft, 
-                                           alpha_grid=np.array(args.alpha_grid),
-                                           n_jobs=args.n_jobs)
-    est_cor = results['sparse_estimate']
-    
-    # Save the correlations
-    df_cor = pd.DataFrame(
-        est_cor,
-        index=feature_name,
-        columns=feature_name
+    # ---- Build model ----
+    activation = None if args.activation in ("linear", "none") else args.activation
+    model = MetVAE(
+        data=data,
+        features_as_rows=False,
+        meta=meta,
+        continuous_covariate_keys=args.continuous_covariate_keys,
+        categorical_covariate_keys=args.categorical_covariate_keys,
+        latent_dim=args.latent_dim,
+        hidden_dims=args.hidden_dims,
+        activation=activation,
+        use_gpu=args.use_gpu,
+        logging=args.logging,
+        seed=args.seed
     )
-    df_cor.to_csv(args.save_path + 'df_corr.csv')
     
+    # ---- Train ----
+    model.train(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        max_epochs=args.max_epochs,
+        learning_rate=args.learning_rate,
+        max_grad_norm=None if (args.max_grad_norm is None or args.max_grad_norm < 0) else args.max_grad_norm,
+        shuffle=True,
+        deterministic=args.deterministic
+    )
+    
+    ckpt = {
+        "model_state_dict": model.model.state_dict(),
+        "optimizer_state_dict": (
+            model.optimizer.state_dict()
+            if hasattr(model, "optimizer") and getattr(model, "optimizer") is not None
+            else None
+        ),
+        "train_loss": getattr(model, "train_loss", []),
+        # Keep raw epoch (if available) and the more useful 'trained_epochs'
+        "epoch": getattr(model, "current_epoch", None),
+        "trained_epochs": len(getattr(model, "train_loss", [])),
+        "learning_rate": args.learning_rate,
+    }
+
+    os.makedirs(args.save_path, exist_ok=True)
+    torch.save(ckpt, os.path.join(args.save_path, 'model_state.pth'))
+    
+    # ---- Correlations with multiple imputations ----
+    model.get_corr(
+        num_sim=args.num_sim,
+        workers=args.workers,
+        batch_size=args.impute_batch_size,
+        threshold=args.threshold,
+        seed=args.seed
+    )
+    
+    # ---- Sparsification ----
+    if args.sparse_method == 'pval':
+        filt = model.sparse_by_p(
+            p_adj_method=args.p_adj_method,
+            cutoff=args.cutoff
+        )
+        filt['estimate'].to_csv(os.path.join(args.save_path, 'df_corr.csv'))
+        filt['p_value'].to_csv(os.path.join(args.save_path, 'p_values.csv'))
+        filt['q_value'].to_csv(os.path.join(args.save_path, 'q_values.csv'))
+        filt['sparse_estimate'].to_csv(os.path.join(args.save_path, 'df_sparse_pval.csv'))
+    else:  # SEC
+        rho_val = None if args.rho is None or args.rho < 0 else float(args.rho)
+        restart_val = None if (args.sec_restart is None or args.sec_restart < 0) else int(args.sec_restart)
+        sec_out = model.sparse_by_sec(
+            rho=rho_val,
+            epsilon=args.sec_epsilon,
+            tol=args.sec_tol,
+            max_iter=args.sec_max_iter,
+            restart=restart_val,
+            line_search_apg=not args.no_line_search_apg,
+            delta=args.sec_delta,
+            n_samples=None,
+            c_delta=args.sec_c_delta,
+            threshold=args.sec_threshold,
+            c_grid=args.c_grid,
+            n_splits=args.n_splits,
+            seed=args.seed,
+            workers=args.sec_workers,
+            refine=(not args.no_refine),
+            refine_points=args.refine_points
+        )
+        # Save outputs
+        sec_out['estimate'].to_csv(os.path.join(args.save_path, 'df_corr.csv'))
+        sec_out['sparse_estimate'].to_csv(os.path.join(args.save_path, 'df_sparse_sec.csv'))
+        # Optional extras
+        if sec_out.get('best_rho') is not None:
+            with open(os.path.join(args.save_path, 'sec_selected.txt'), 'w') as f:
+                f.write(f"best_rho={sec_out['best_rho']}\n")
+        if sec_out.get('scores_by_rho') is not None:
+            sec_out['scores_by_rho'].to_csv(os.path.join(args.save_path, 'sec_scores.csv'), index=False)
+
 if __name__ == '__main__':
     main()
