@@ -618,12 +618,13 @@ class MetVAE():
 
         # Set up data loading with mini-batches
         ds = TensorDataset(y_data)
+        pin_memory_flag = (y_data.device.type == "cpu" and self.device.type == "cuda")
         dl = DataLoader(
             ds,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=(self.device.type == "cuda"),
+            pin_memory=pin_memory_flag,
             drop_last=False,
             generator=dl_gen,                  
             worker_init_fn=_worker_init_fn if num_workers > 0 else None,  
