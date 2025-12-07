@@ -24,6 +24,22 @@ def main():
     parser.add_argument('--categorical_covariate_keys', nargs='+', type=str, default=[],
                         help='Names of categorical covariates in meta')
     
+    # Zero-proportion filtering (preprocessing)
+    parser.add_argument(
+        '--feature_zero_threshold',
+        type=float,
+        default=0.3,
+        help='Drop features with proportion of zeros > threshold. '
+             'Set to None (or omit) to keep all features except all-zero.'
+    )
+    parser.add_argument(
+        '--sample_zero_threshold',
+        type=float,
+        default=None,
+        help='Drop samples with proportion of zeros > threshold. '
+             'Default None: keep all samples except all-zero.'
+    )
+    
     # Model architecture
     parser.add_argument("--latent_dim", type=int, default=10, help="Latent dimension")
     parser.add_argument("--hidden_dims", nargs="*", type=int, default=None,
@@ -94,6 +110,26 @@ def main():
                         help='Number of points in the refinement bracket (inclusive)')
     parser.add_argument('--sec_workers', type=int, default=-1,
                         help='CPU workers for CV; -1 = all cores (GPU or <=1 runs sequentially)')
+    
+    # GraphML export options
+    parser.add_argument(
+        '--export_graphml',
+        action='store_true',
+        help='If set, export GraphML correlation networks from the final sparse matrix.'
+    )
+    parser.add_argument(
+        '--graphml_cutoffs',
+        nargs='+',
+        type=float,
+        default=[0.7],
+        help='Absolute correlation cutoffs for GraphML export (e.g. 0.9 0.8 0.7 ...).'
+    )
+    parser.add_argument(
+        '--graphml_prefix',
+        type=str,
+        default='correlation_graph_cutoff',
+        help='Filename prefix for GraphML files (suffix = cutoff, extension = .graphml).'
+    )
 
     args = parser.parse_args()
 
@@ -116,6 +152,8 @@ def main():
         activation=activation,
         use_gpu=args.use_gpu,
         logging=args.logging,
+        feature_zero_threshold=args.feature_zero_threshold,
+        sample_zero_threshold=args.sample_zero_threshold,
         seed=args.seed
     )
     
@@ -169,7 +207,7 @@ def main():
     else:  # SEC
         rho_val = None if args.rho is None or args.rho < 0 else float(args.rho)
         restart_val = None if (args.sec_restart is None or args.sec_restart < 0) else int(args.sec_restart)
-        sec_out = model.sparse_by_sec(
+        filt = model.sparse_by_sec(
             rho=rho_val,
             epsilon=args.sec_epsilon,
             tol=args.sec_tol,
@@ -188,14 +226,23 @@ def main():
             refine_points=args.refine_points
         )
         # Save outputs
-        sec_out['estimate'].to_csv(os.path.join(args.save_path, 'df_corr.csv'))
-        sec_out['sparse_estimate'].to_csv(os.path.join(args.save_path, 'df_sparse_sec.csv'))
+        filt['estimate'].to_csv(os.path.join(args.save_path, 'df_corr.csv'))
+        filt['sparse_estimate'].to_csv(os.path.join(args.save_path, 'df_sparse_sec.csv'))
         # Optional extras
-        if sec_out.get('best_rho') is not None:
+        if filt.get('best_rho') is not None:
             with open(os.path.join(args.save_path, 'sec_selected.txt'), 'w') as f:
-                f.write(f"best_rho={sec_out['best_rho']}\n")
-        if sec_out.get('scores_by_rho') is not None:
-            sec_out['scores_by_rho'].to_csv(os.path.join(args.save_path, 'sec_scores.csv'), index=False)
+                f.write(f"best_rho={filt['best_rho']}\n")
+        if filt.get('scores_by_rho') is not None:
+            filt['scores_by_rho'].to_csv(os.path.join(args.save_path, 'sec_scores.csv'), index=False)
+            
+    # ---- GraphML export ----
+    if args.export_graphml:
+        model.export_graphml(
+            sparse_df=filt['sparse_estimate'],
+            cutoffs=args.graphml_cutoffs,
+            output_dir=args.save_path,
+            file_prefix=args.graphml_prefix,
+        )
 
 if __name__ == '__main__':
     main()

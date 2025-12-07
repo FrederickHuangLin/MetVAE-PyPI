@@ -53,9 +53,21 @@ model = MetVAE(
     categorical_covariate_keys=["sex", "batch"],
     latent_dim=10,
     use_gpu=True,                    # use CUDA if available
-    seed=0
+    seed=0,
+    feature_zero_threshold=0.3,      # drop features with zero proportion > 0.3
+    sample_zero_threshold=None       # optionally drop samples with many zeros
 )
 ```
+
+`feature_zero_threshold` (float or `None`):
+
+- If set (e.g. `0.3`), features with a proportion of zeros **> threshold** are removed during preprocessing.
+- If `None`, no feature filtering by zero proportion is applied (all-zero features are still removed later).
+
+`sample_zero_threshold` (float or `None`):
+
+- If set (e.g. `0.8`), samples with a proportion of zeros **> threshold** are removed during preprocessing.
+- If `None`, no sample filtering by zero proportion is applied (all-zero samples are still removed later).
 
 ### 3. Train
 
@@ -269,6 +281,43 @@ sparse_corr_sec = results_sec["sparse_estimate"].values
 
 ------
 
+## GraphML Export of Correlation Networks
+
+After you obtain a sparsified correlation matrix (either from `sparse_by_p` or `sparse_by_sec`), you can export it as one or more **GraphML** files for downstream network analysis (e.g. in Cytoscape, Gephi, igraph).
+
+### Python API
+
+```
+from metvae.model import MetVAE
+
+# After training and correlation estimation
+results_p = model.sparse_by_p(p_adj_method="fdr_bh", cutoff=0.01)
+sparse_df = results_p["sparse_estimate"]
+
+# Export one GraphML per cutoff
+G = model.export_graphml(
+    sparse_df=sparse_df,
+    cutoffs=[0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+    output_dir="./results/graphs",
+    file_prefix="correlation_graph_cutoff"
+)
+```
+
+This will create files like:
+
+- `correlation_graph_cutoff0.9.graphml`
+- `correlation_graph_cutoff0.8.graphml`
+- …
+- `correlation_graph_cutoff0.3.graphml`
+
+Each file contains an undirected graph where:
+
+- Nodes = metabolites (feature names)
+- Edges = pairs with `|correlation| >= cutoff`
+- Edge attributes include `weight`, `correlation`, `EdgeScore`, and `EdgeType` (e.g. `"Correlation_cutoff0.7"`)
+
+> Note: GraphML export requires `networkx` (`pip install networkx`).
+
 ## Command Line Interface (`metvae-cli`)
 
 The CLI mirrors the Python API:
@@ -279,6 +328,7 @@ metvae-cli \
   --meta meta.csv \
   --continuous_covariate_keys age bmi \
   --categorical_covariate_keys sex batch \
+  --feature_zero_threshold 0.3 \
   --latent_dim 10 \
   --batch_size 128 \
   --max_epochs 1000 \
@@ -287,7 +337,10 @@ metvae-cli \
   --corr_threshold 0.2 \
   --sparse_method pval \
   --p_adj_method fdr_bh \
-  --cutoff 0.05
+  --cutoff 0.05 \
+  --export_graphml \
+  --graphml_cutoffs 0.9 0.8 0.7 0.6 0.5 0.4 0.3 \
+  --graphml_prefix hcc_correlation_graph_cutoff
 ```
 
 To use SEC instead of p-value filtering:
@@ -298,6 +351,7 @@ metvae-cli \
   --meta meta.csv \
   --continuous_covariate_keys age bmi \
   --categorical_covariate_keys sex batch \
+  --feature_zero_threshold 0.3 \
   --latent_dim 10 \
   --batch_size 128 \
   --max_epochs 1000 \
@@ -305,7 +359,10 @@ metvae-cli \
   --num_sim 100 \
   --corr_threshold 0.2 \
   --sparse_method sec \
-  --rho 2.2
+  --rho 2.2 \
+  --export_graphml \
+  --graphml_cutoffs 0.9 0.8 0.7 0.6 0.5 0.4 0.3 \
+  --graphml_prefix hcc_correlation_graph_cutoff
 ```
 
 If you want automatic `rho` selection, use the CLI flags that correspond to the SEC hyperparameters (e.g., `--sec-epsilon`, `--sec-tol`, `--sec-c-grid`, `--sec-n-splits`, etc.), which map directly onto the `sparse_by_sec` parameters described above.

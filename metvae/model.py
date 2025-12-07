@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Optional, Dict, List, Literal, Sequence
+from typing import Optional, Iterable, Dict, List, Literal, Sequence
 import random
 import math
 import numpy as np
@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from joblib import Parallel, delayed, parallel_backend
 from .vae import VAE
-from .utils import _make_valid_column_name, _torch_to_df
+from .utils import _make_valid_column_name, _torch_to_df, _corr_to_long
 from .impute_missing import _ols_estimate, _fit_censored_normal
 from .compute_corr import _compute_correlation
 from .sparse import _matrix_p_adjust, _p_filter, _SEC, _SEC_cv
@@ -24,7 +24,9 @@ def _data_pre_process(
         continuous_covariate_keys: Optional[List[str]] = None,
         categorical_covariate_keys: Optional[List[str]] = None,
         device: Optional[str] = None,
-        dtype: torch.dtype = torch.float64
+        dtype: torch.dtype = torch.float64,
+        feature_zero_threshold: float = 0.3,
+        sample_zero_threshold: Optional[float] = None
     ):
     """
     Internal function for preprocessing compositional data with metadata covariates.
@@ -48,6 +50,10 @@ def _data_pre_process(
         Torch device to place tensors on (e.g., 'cpu', 'cuda'). If None, uses default device.
     dtype : torch.dtype, optional
         Data type for returned torch tensors (default torch.float64).
+    feature_zero_threshold: float
+        Drop features with proportion of zeros > threshold (default 0.3)
+    sample_zero_threshold: float, optional
+        drop samples with proportion of zeros > threshold (default None: keep all)
 
     Returns
     -------
@@ -73,146 +79,186 @@ def _data_pre_process(
     4. Covariate adjustment if metadata is provided
     5. Conversion to PyTorch tensors for downstream analysis
     """
-    # --- Input Validation and Data Organization --- 
-    device = torch.device(device)
-    
+    # --- Input Validation and Data Organization ---
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+
     if not isinstance(data, pd.DataFrame):
         raise TypeError('The input data must be a pandas.DataFrame')
-     
+
     # Ensure features are columns for consistent processing
     if features_as_rows:
         data = data.T
+
+    # Align metadata
+    if meta is not None:
+        if not isinstance(meta, pd.DataFrame):
+            raise TypeError('The meta data must be a pandas.DataFrame or None')
+
+        # Keep only metadata rows that appear in data (and preserve order of data)
+        missing = set(data.index) - set(meta.index)
+        if missing:
+            raise ValueError(f"The following sample names are missing in the sample meta data: {missing}")
+        meta = meta.loc[data.index]
+
+    # --- Zero-proportion filtering ---
+    n0, d0 = data.shape
+    print(f"Start: samples={n0}, features={d0}")
+
+    # Treat NaNs as zeros for the sparsity calculation
+    data_zeros_view = data.fillna(0)
+
+    # (1) Feature filtering by zeros proportion
+    if feature_zero_threshold is not None:
+        feat_zero_prop = (data_zeros_view.eq(0)).mean(axis=0)  # per feature
+        feat_drop_mask = feat_zero_prop > feature_zero_threshold
+        n_feat_drop = int(feat_drop_mask.sum())
+        if n_feat_drop > 0:
+            data = data.loc[:, ~feat_drop_mask]
+            print(f"Filtered features: removed {n_feat_drop} with zero proportion > {feature_zero_threshold:.2f}")
+        else:
+            print(f"Filtered features: removed 0 (threshold {feature_zero_threshold:.2f})")
+
+    # (2) Sample filtering by zeros proportion (optional)
+    if sample_zero_threshold is not None:
+        # recompute view after feature filtering
+        data_zeros_view = data.fillna(0)
+        samp_zero_prop = (data_zeros_view.eq(0)).mean(axis=1)  # per sample
+        samp_drop_mask = samp_zero_prop > sample_zero_threshold
+        n_samp_drop = int(samp_drop_mask.sum())
+        if n_samp_drop > 0:
+            data = data.loc[~samp_drop_mask, :]
+            if meta is not None:
+                meta = meta.loc[data.index]
+            print(f"Filtered samples: removed {n_samp_drop} with zero proportion > {sample_zero_threshold:.2f}")
+        else:
+            print(f"Filtered samples: removed 0 (threshold {sample_zero_threshold:.2f})")
+    else:
+        print("Filtered samples: none (no sample_zero_threshold provided)")
+
+    n1, d1 = data.shape
+    print(f"After zero filtering: samples={n1}, features={d1}")
+
+    # --- Names (after filtering) ---
     sample_name = data.index.tolist()
     feature_name = data.columns.tolist()
-    data = torch.tensor(data.values, dtype=dtype, device=device)
-    data = torch.nan_to_num(data, nan=0.0) # treats NaNs as zeros
-    
+
+    # --- Convert to torch & basic cleaning ---
+    tdata = torch.tensor(data.values, dtype=dtype, device=dev)
+    # treat NaNs as zeros
+    tdata = torch.nan_to_num(tdata, nan=0.0)
+
     # Check for and fix negative values
-    neg_mask = data < 0
+    neg_mask = tdata < 0
     num_neg = int(neg_mask.sum().item())
-    
     if num_neg > 0:
         warnings.warn(
             f"The dataset contains {num_neg} negative values. "
             "They have been converted to zeros, but please double-check "
             "that this preprocessing step is appropriate for your data."
         )
-        data = torch.where(neg_mask, torch.zeros_like(data), data)
-    
-    # Discard rows that are all-zero-or-NaN
-    row_all_zero = (data == 0).all(dim=1)             # (n,)
+        tdata = torch.where(neg_mask, torch.zeros_like(tdata), tdata)
+
+    # Discard rows that are all-zero
+    row_all_zero = (tdata == 0).all(dim=1)
     if row_all_zero.any():
-        # filter data and metadata/samplenames consistently
         keep_idx = ~row_all_zero
-        # keep sample_name list in sync
+        dropped = int(row_all_zero.sum().item())
+        tdata = tdata[keep_idx]
         sample_name = [s for i, s in enumerate(sample_name) if keep_idx[i].item()]
-        data = data[keep_idx]
         if meta is not None:
-            # if smd still a pandas df at this point, do the same selection there
-            # otherwise if it's torch already:
-            meta = meta.loc[keep_idx.cpu().numpy(), :]
-    n, d = data.shape
+            meta = meta.loc[sample_name]
+        print(f"Removed {dropped} all-zero samples after cleaning.")
+    n, d = tdata.shape
+    print(f"Post-cleaning (convert negative values to zeros and drop all-zero samples): samples={n}, features={d}")
 
-    # Count zeros in each feature for handling censored values
-    num_zero = (data == 0).sum(dim=0).float()
-    
-    # --- Metadata Processing and Validation --- 
-    if meta is not None and not isinstance(meta, pd.DataFrame):
-        raise TypeError('The meta data must be a pandas.DataFrame or None')
+    # Count zeros in each feature (torch)
+    num_zero = (tdata == 0).sum(dim=0).float()
 
-    # Ensure all samples in abundance data have corresponding metadata
-    if isinstance(meta, pd.DataFrame):
-        if not set(sample_name).issubset(meta.index):
-            missing = set(sample_name) - set(meta.index)
-            raise ValueError(f"The following sample names are missing in the sample meta data: {missing}")
-
-    # Process continuous and categorical covariates from metadata
-    if isinstance(meta, pd.DataFrame):
+    # --- Metadata Processing and Validation ---
+    if meta is not None:
         # Handle continuous covariates
         smd_cont = meta.loc[:, continuous_covariate_keys] if continuous_covariate_keys is not None else None
-        
-        # Process categorical covariates with dummy encoding
+
+        # Categorical (one-hot)
         smd_cat = None
         if categorical_covariate_keys is not None:
             smd_cat = meta.loc[:, categorical_covariate_keys].apply(lambda x: x.astype('category'))
-            smd_cat = pd.get_dummies(smd_cat, drop_first=True, dtype=float) # One-hot encoding
-            smd_cat.columns = [_make_valid_column_name(c) for c in smd_cat.columns] # Ensure valid column names
-    
-        # Combine processed covariates
+            smd_cat = pd.get_dummies(smd_cat, drop_first=True, dtype=float)
+            smd_cat.columns = [_make_valid_column_name(c) for c in smd_cat.columns]
+
+        # Combine
         if smd_cont is not None and smd_cat is not None:
-            smd = pd.concat([smd_cont, smd_cat], axis=1)
-            confound_name = smd.columns.tolist()
+            smd_df = pd.concat([smd_cont, smd_cat], axis=1)
+            confound_name = smd_df.columns.tolist()
         elif smd_cont is not None:
-            smd = smd_cont
+            smd_df = smd_cont
             confound_name = smd_cont.columns.tolist()
         elif smd_cat is not None:
-            smd = smd_cat
+            smd_df = smd_cat
             confound_name = smd_cat.columns.tolist()
         else:
-            smd = None
+            smd_df = None
             confound_name = None
     else:
-        smd = None
+        smd_df = None
         confound_name = None
-    
-    if smd is not None:
-        smd = torch.tensor(smd.values, dtype=dtype, device=device)
+
+    if smd_df is not None:
+        smd = torch.tensor(smd_df.values, dtype=dtype, device=dev)
         p = smd.shape[1] + 1
     else:
-        confound_name = None
+        smd = None
         p = 1
 
-    # --- CLR Transformation --- 
-    # Handle zeros by converting to NaN after log transform
+    # --- CLR Transformation ---
     log_data = torch.where(
-        data > 0, torch.log(data), 
-        torch.tensor(float('nan'), dtype=data.dtype, device=device)
-        )
-    
-    # Calculate geometric mean (shift) for CLR transformation
+        tdata > 0, torch.log(tdata),
+        torch.tensor(float('nan'), dtype=tdata.dtype, device=dev)
+    )
     shift = torch.nanmean(log_data, dim=1, keepdim=True)
     clr_data = log_data - shift
 
-    # Calculate threshold values for censored observations (raw -> per-feature min positive)
-    th_raw = torch.where(data > 0, data, torch.tensor(float('inf'), dtype=data.dtype, device=device)).min(dim=0).values
-    th_raw = torch.where(th_raw == float('inf'), torch.tensor(1e-5, dtype=data.dtype, device=device), th_raw)
-    
-    # Convert thresholds to CLR space
+    # Threshold values (per-feature min positive)
+    th_raw = torch.where(tdata > 0, tdata, torch.tensor(float('inf'), dtype=tdata.dtype, device=dev)).min(dim=0).values
+    th_raw = torch.where(th_raw == float('inf'), torch.tensor(1e-5, dtype=tdata.dtype, device=dev), th_raw)
     clr_th = torch.log(th_raw) - shift
 
-    # --- Parameter Estimation --- 
+    # --- Parameter Estimation ---
     init_params = _ols_estimate(clr_data, smd)  # (p+1, d)
 
-    # --- Handle Zero Values and Estimate Final Parameters --- 
+    # --- Handle zeros via censored normal, else use init ---
     if torch.any(num_zero != 0):
-        # Use censored normal MLE for features with zeros
         clr_params = _fit_censored_normal(
             clr_data, smd, clr_th,
             init_estimates=init_params,
             max_iter=100,
         )
-        clr_log_sd = clr_params[p, :]
-        clr_sd = torch.exp(clr_log_sd)
-        clr_mean = clr_params[0, :]
     else:
-        # Use initial estimates if no zeros present
         clr_params = init_params
-        clr_log_sd = clr_params[p, :]
-        clr_sd = torch.exp(clr_log_sd)
-        clr_mean = clr_params[0, :]
 
-    # Part 6: Deconfound Data if Metadata Present
+    clr_log_sd = clr_params[p, :]
+    clr_sd = torch.exp(clr_log_sd)
+    clr_mean = clr_params[0, :]
+
+    # Deconfound if metadata present
     if smd is not None:
         clr_coef = clr_params[1:p, :]
-        clr_data -= smd @ clr_coef
+        clr_data = clr_data - smd @ clr_coef
     else:
         clr_coef = None
-    
-    # Part 7: Prepare Outputs
-    outputs = {'clr_data': clr_data, 'meta': smd, 'num_zero': num_zero, 'shift': shift,
-               'clr_mean': clr_mean, 'clr_sd': clr_sd, 'clr_coef': clr_coef, 
-               'sample_name': sample_name, 'feature_name': feature_name, 'confound_name': confound_name}
-    
+
+    outputs = {
+        'clr_data': clr_data,
+        'meta': smd,
+        'num_zero': num_zero,
+        'shift': shift,
+        'clr_mean': clr_mean,
+        'clr_sd': clr_sd,
+        'clr_coef': clr_coef,
+        'sample_name': sample_name,
+        'feature_name': feature_name,
+        'confound_name': confound_name
+    }
     return outputs
 
 def _random_initial(
@@ -367,6 +413,12 @@ class MetVAE():
     
     dtype : torch.dtype, default=torch.float64
         Numeric dtype used for tensors in the model and preprocessed data.
+        
+    feature_zero_threshold: float
+        Drop features with proportion of zeros > threshold (default 0.3)
+        
+    sample_zero_threshold: float, optional
+        drop samples with proportion of zeros > threshold (default None: keep all)
     
     seed : int, default=0
         Random seed used during preprocessing/model initialization/training for reproducibility.
@@ -458,6 +510,8 @@ class MetVAE():
             use_gpu: bool = False,
             logging: bool = False,
             dtype: torch.dtype = torch.float64,
+            feature_zero_threshold: float = 0.3,
+            sample_zero_threshold: Optional[float] = None,
             seed: int = 0
     ):
         """
@@ -491,7 +545,10 @@ class MetVAE():
             continuous_covariate_keys=continuous_covariate_keys,
             categorical_covariate_keys=categorical_covariate_keys,
             device=self.device,
-            dtype=dtype)
+            dtype=dtype,
+            feature_zero_threshold=feature_zero_threshold,
+            sample_zero_threshold=sample_zero_threshold
+            )
         
         # Unpack preprocessed data components
         self.meta = pp['meta']
@@ -1428,6 +1485,91 @@ class MetVAE():
         }
         return outputs
     
+    def export_graphml(
+        self,
+        sparse_df: pd.DataFrame,
+        cutoffs: Iterable[float],
+        output_dir: Optional[str] = None,
+        file_prefix: str = "correlation_graph_cutoff",
+    ):
+        """
+        Take a sparse correlation matrix and write
+        one GraphML file per cutoff.
+    
+        Parameters
+        ----------
+        sparse_df : pandas.DataFrame
+            Final sparse correlation estimate (e.g. ``filt["sparse_estimate"]``).
+    
+        cutoffs : Iterable[float]
+            Absolute correlation cutoffs, e.g. ``[0.9, 0.8, 0.7, ...]``.
+    
+        output_dir : Optional[str], default=None
+            Directory where the ``.graphml`` files will be written.
+    
+        file_prefix : str, default="correlation_graph_cutoff"
+            Prefix used for filenames; the numeric cutoff and the ``.graphml``
+            extension are appended automatically.
+        Returns
+        -------
+        graphs : Dict[float, nx.Graph]
+            One undirected graph per cutoff (only for cutoffs that yielded ≥1 edge).
+        """
+        try:
+            import networkx as nx
+        except ImportError as exc:
+            raise RuntimeError(
+                "networkx is required for GraphML export. Install it with `pip install networkx`."
+            ) from exc
+
+        if sparse_df is None or not isinstance(sparse_df, pd.DataFrame):
+            raise ValueError("sparse_df must be a pandas DataFrame with the sparse correlation matrix.")
+
+        # Long-format edge list using your helper (expects columns: node1, node2, correlation)
+        df_long = _corr_to_long(sparse_df)
+
+        # Normalize/sort cutoffs (largest first)
+        cutoffs = sorted({float(c) for c in cutoffs if float(c) > 0.0}, reverse=True)
+
+        graphs: Dict[str, nx.Graph] = {}
+
+        # Create output dir only if saving is requested
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+
+        for cutoff in cutoffs:
+            edge_type = f"Correlation_cutoff{cutoff:g}"
+            sub = df_long.loc[df_long["correlation"].abs() >= cutoff]
+
+            if sub.empty:
+                continue  # nothing to build/save for this cutoff
+
+            # Build graph
+            G = nx.Graph()
+            for row in sub.itertuples(index=False):
+                u = str(row.node1)
+                v = str(row.node2)
+                c = float(row.correlation)
+                G.add_edge(
+                    u,
+                    v,
+                    weight=c,
+                    correlation=c,
+                    EdgeScore=c,
+                    EdgeType=edge_type,
+                    id=edge_type,
+                )
+
+            graphs[edge_type] = G
+
+            # Save only if requested
+            if output_dir is not None:
+                filename = f"{file_prefix}{cutoff:g}.graphml"
+                path = os.path.join(output_dir, filename)
+                nx.write_graphml(G, path)
+
+        return graphs
+    
     def clr_loading(self):
         """
         Extract and format the VAE's learned feature loadings in CLR space.
@@ -1480,7 +1622,7 @@ def _simple_inference(
         meta: Optional[pd.DataFrame] = None,
         continuous_covariate_keys: Optional[List[str]] = None,
         categorical_covariate_keys: Optional[List[str]] = None,
-        num_sim: int = 1000,
+        num_sim: int = 100,
         threshold: float = 0.2,   # kept for p_value branch only
         sparse_method: Literal['pval', 'sec'] = 'pval',
         p_adj_method: Literal['bonferroni','sidak','holm-sidak','holm','simes-hochberg','hommel','fdr_bh','fdr_by','fdr_tsbh','fdr_tsbky'] = 'fdr_bh',
