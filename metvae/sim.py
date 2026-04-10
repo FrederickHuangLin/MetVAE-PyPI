@@ -2,6 +2,19 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+def _scale_continuous_covariates(x_cont):
+    """
+    Center and scale continuous covariates column-wise.
+    Constant columns are centered and left with unit scale to avoid division by zero.
+    """
+    if x_cont is None:
+        return None
+
+    x_cont = x_cont.astype(float).copy()
+    means = x_cont.mean(axis=0)
+    stds = x_cont.std(axis=0, ddof=0).replace(0, 1.0)
+    return (x_cont - means) / stds
+
 def sim_data(n, d, cor_pairs=0, mu=None, sigma=1, x=None, cont_list=None, cat_list=None, da_prop=0.1):
     """
     Simulate abundance data with confounding effects and correlation structure.
@@ -97,6 +110,7 @@ def sim_data(n, d, cor_pairs=0, mu=None, sigma=1, x=None, cont_list=None, cat_li
     if x is not None:
         # Handle continuous confounders
         x_cont = x[cont_list] if cont_list is not None else None
+        x_cont = _scale_continuous_covariates(x_cont)
 
         # Handle categorical confounders
         if cat_list is not None:
@@ -140,7 +154,6 @@ def sim_data(n, d, cor_pairs=0, mu=None, sigma=1, x=None, cont_list=None, cat_li
     y = pd.DataFrame(y, index=sample_name, columns=feature_name)
 
     return {'cor_matrix': cor_matrix, 'y': y, 'x': x, 'beta': beta}
-
 
 
 

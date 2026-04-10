@@ -18,7 +18,7 @@ this_dir = Path(__file__).parent
 long_description = (this_dir / "README.md").read_text(encoding="utf-8")
 
 setup(name='metvae',
-      version='0.0.2',
+      version='1.0.0',
       description=description,
       long_description=open("README.md").read(),
       long_description_content_type="text/markdown",

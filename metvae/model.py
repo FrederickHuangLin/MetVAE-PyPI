@@ -261,6 +261,24 @@ def _data_pre_process(
     }
     return outputs
 
+def _scale_continuous_metadata(
+        meta: Optional[pd.DataFrame],
+        continuous_covariate_keys: Optional[List[str]]
+    ) -> Optional[pd.DataFrame]:
+    """
+    Center and scale continuous covariates while leaving all other columns unchanged.
+    Constant columns are centered and left with unit scale to avoid division by zero.
+    """
+    if meta is None or continuous_covariate_keys is None:
+        return meta
+
+    scaled = meta.copy()
+    cont = scaled.loc[:, continuous_covariate_keys].astype(float)
+    means = cont.mean(axis=0)
+    stds = cont.std(axis=0, ddof=0).replace(0, 1.0)
+    scaled.loc[:, continuous_covariate_keys] = (cont - means) / stds
+    return scaled
+
 def _random_initial(
         y: torch.Tensor, 
         sample_size: int, 
@@ -393,8 +411,9 @@ class MetVAE():
         Names of categorical covariates in ``meta`` to adjust for (e.g., ``['sex', 'treatment']``).
         These are one-hot encoded automatically before adjustment.
     
-    latent_dim : int, default=10
-        Dimension of the latent space. Larger values allow more complex structure but require more data.
+    latent_dim : int, optional
+        Dimension of the latent space. If None, defaults to ``min(n_samples, n_features)``
+        after preprocessing. Larger values allow more complex structure but require more data.
     
     hidden_dims : list[int] or None, default=None
         Hidden layer sizes for the encoder (and, if applicable, decoder) MLP(s), e.g. ``[256, 128]``.
@@ -439,7 +458,8 @@ class MetVAE():
         Number of features (metabolites) after preprocessing.
     
     latent_dim : int
-        Dimension of the VAE latent space (echoes the constructor argument).
+        Dimension of the VAE latent space. Defaults to ``min(sample_dim, feature_dim)``
+        when not specified.
     
     clr_data : torch.Tensor
         CLR-transformed and covariate-adjusted data of shape (n_samples, n_features).
@@ -504,7 +524,7 @@ class MetVAE():
             meta: Optional[pd.DataFrame] = None,
             continuous_covariate_keys: Optional[List[str]] = None,
             categorical_covariate_keys: Optional[List[str]] = None,
-            latent_dim: int = 10,
+            latent_dim: Optional[int] = None,
             hidden_dims: Optional[List[int]] = None,
             activation: Optional[str] = "relu",
             use_gpu: bool = False,
@@ -536,12 +556,14 @@ class MetVAE():
         torch.manual_seed(self.base_seed)
         if self.device.type == 'cuda':
             torch.cuda.manual_seed_all(self.base_seed)
+
+        scaled_meta = _scale_continuous_metadata(meta, continuous_covariate_keys)
             
         # This handles CLR transformation, zero value processing, and covariate/confounder adjustment
         pp = _data_pre_process(
             data=data,
             features_as_rows=features_as_rows,
-            meta=meta,
+            meta=scaled_meta,
             continuous_covariate_keys=continuous_covariate_keys,
             categorical_covariate_keys=categorical_covariate_keys,
             device=self.device,
@@ -565,7 +587,7 @@ class MetVAE():
         # Shapes
         self.sample_dim = self.clr_data.shape[0]
         self.feature_dim = self.clr_data.shape[1]
-        self.latent_dim = latent_dim
+        self.latent_dim = min(self.sample_dim, self.feature_dim) if latent_dim is None else latent_dim
 
         # Initialize the VAE model architecture
         self.model = VAE(
