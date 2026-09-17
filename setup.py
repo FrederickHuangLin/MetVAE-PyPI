@@ -1,4 +1,6 @@
+import re
 from pathlib import Path
+
 from setuptools import find_packages, setup
 
 classes = """
@@ -11,16 +13,22 @@ classes = """
 """
 classifiers = [s.strip() for s in classes.split('\n') if s]
 
-description = ('Metabolomics Variational Autoencoders.')
+description = 'Metabolomics Variational Autoencoders.'
 
-# Read README with explicit encoding (avoids Unicode issues on Windows)
 this_dir = Path(__file__).parent
 long_description = (this_dir / "README.md").read_text(encoding="utf-8")
 
+# Single source of the version string
+version_source = (this_dir / "metvae" / "__init__.py").read_text(encoding="utf-8")
+version_match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', version_source, re.M)
+if version_match is None:
+    raise RuntimeError("Unable to find __version__ in metvae/__init__.py")
+version = version_match.group(1)
+
 setup(name='metvae',
-      version='1.0.0',
+      version=version,
       description=description,
-      long_description=open("README.md").read(),
+      long_description=long_description,
       long_description_content_type="text/markdown",
       author="Huang Lin",
       author_email="huanglinfrederick@gmail.com",
@@ -29,24 +37,25 @@ setup(name='metvae',
       url="https://github.com/FrederickHuangLin/MetVAE-PyPI",
       license="MIT",
       license_files=["LICENSE"],
-      packages=find_packages(exclude=['tests', 'tests.*']),  # Excludes tests
+      packages=find_packages(exclude=['metvae.tests', 'metvae.tests.*', 'tests', 'tests.*']),
       install_requires=[
-          'joblib>=1.2.0',
-          'numpy>=1.20.0',
-          'scipy',
-          'statsmodels',
-          'tensorboard',
-          'tqdm',
-          'pandas>=1.0.0',
-          'torch>=1.8.0',
-          'pytorch-lightning>=1.3.1',
-          "networkx>=2.6"
+          'numpy>=1.21',
+          'pandas>=1.5',
+          'scipy>=1.7',
+          'statsmodels>=0.13',
+          'torch>=1.12',
+          'networkx>=2.6',
+          'tqdm>=4.62',
       ],
+      extras_require={
+          'logging': ['tensorboard>=2.9'],
+          'test': ['pytest>=7'],
+      },
       classifiers=classifiers,
       python_requires=">=3.9",
-      entry_points = {
+      entry_points={
           'console_scripts': [
               'metvae-cli=metvae.cli:main'
           ]
       }
-     )
+      )
