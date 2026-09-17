@@ -4,9 +4,10 @@ from typing import Optional, Dict, Sequence, Tuple, List
 import pandas as pd
 import math
 import torch
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from statsmodels.stats.multitest import multipletests
 from .compute_corr import _compute_correlation
+from .utils import _thread_limit
 
 # Helper functions for p-values filtering
 
@@ -14,83 +15,140 @@ def _p_filter(mat: torch.Tensor,
               mat_p: torch.Tensor,
               max_p: float,
               impute_value: float = 0.0) -> torch.Tensor:
-    out = mat.clone()
-    out[mat_p > max_p] = impute_value
-    return out
+    """
+    Replace entries whose p-value exceeds a cutoff.
+
+    Parameters
+    ----------
+    mat : torch.Tensor
+        Matrix of estimates.
+    mat_p : torch.Tensor
+        Matrix of p-values with the same shape as mat.
+    max_p : float
+        Cutoff above which an entry of mat is replaced.
+    impute_value : float
+        Value written in place of a filtered entry.
+
+    Returns
+    -------
+    torch.Tensor
+        Copy of mat with filtered entries set to impute_value.
+    """
+    return torch.where(mat_p > max_p, mat.new_full((), impute_value), mat)
 
 def _matrix_p_adjust(p_matrix: torch.Tensor,
                      method: str = 'fdr_bh') -> torch.Tensor:
+    """
+    Adjust the p-values of a symmetric matrix for multiple comparisons.
+
+    The strict lower triangle is adjusted as a single vector and the result is
+    mirrored into the upper triangle. The diagonal is zero.
+
+    Parameters
+    ----------
+    p_matrix : torch.Tensor
+        Square matrix of p-values.
+    method : str
+        Method passed to statsmodels.stats.multitest.multipletests.
+
+    Returns
+    -------
+    torch.Tensor
+        Symmetric matrix of adjusted p-values with the same shape, dtype and
+        device as p_matrix.
+    """
     device = p_matrix.device
-    dtype  = p_matrix.dtype
+    dtype = p_matrix.dtype
     n = p_matrix.shape[0]
 
-    # Extract lower triangular part of the matrix into a vector
-    tril = torch.tril_indices(n, n, offset=-1, device=device)
-    p_vec = p_matrix[tril[0], tril[1]].detach().to('cpu').numpy()
+    # Strict lower triangle in row-major order
+    tril_mask = torch.ones((n, n), device=device, dtype=torch.bool).tril_(-1)
+    p_vec = p_matrix.masked_select(tril_mask).detach().to('cpu').numpy()
 
-    # Adjust the p-values
     _, q_vec, _, _ = multipletests(p_vec, method=method)
 
-    # Back to Torch and form symmetric matrix
     q_mat = torch.zeros((n, n), device=device, dtype=dtype)
-    q_mat[tril[0], tril[1]] = torch.from_numpy(q_vec).to(device=device, dtype=dtype)
-    q_mat = q_mat + q_mat.T
+    q_mat.masked_scatter_(tril_mask,
+                          torch.from_numpy(q_vec).to(device=device, dtype=dtype))
+    q_mat.add_(q_mat.T.contiguous())
     return q_mat
 
 # Helper functions for SEC
 
 @torch.no_grad()
 def _projection_psd(
-        A: torch.Tensor, *, 
-        jitter0: float = 1e-12, 
-        max_retries: int = 5
+        A: torch.Tensor, *,
+        jitter0: float = 1e-12,
+        max_retries: int = 5,
+        identity: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
-    Robust PSD projection: symmetrize, sanitize, add tiny diagonal jitter,
-    retry eigh with escalating jitter if needed. Works on CPU/GPU.
+    Project a matrix onto the positive semidefinite cone.
 
-    Returns a matrix in the *original dtype* of A.
+    The input is symmetrized, non-finite entries are replaced by finite values,
+    and the eigendecomposition is taken in float64 after adding a diagonal
+    jitter proportional to the mean absolute entry. The jitter is multiplied by
+    ten after a failed decomposition.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        Square matrix, or a batch of square matrices.
+    jitter0 : float
+        Relative size of the initial diagonal jitter.
+    max_retries : int
+        Number of jitter escalations after the first attempt.
+    identity : torch.Tensor or None
+        Precomputed identity matrix. It is used only when its shape, dtype and
+        device match the float64 working copy of A.
+
+    Returns
+    -------
+    torch.Tensor
+        Positive semidefinite matrix in the dtype of A.
+
+    Raises
+    ------
+    RuntimeError
+        If the eigendecomposition fails at every jitter level.
     """
     orig_dtype = A.dtype
     A = 0.5 * (A + A.transpose(-1, -2))
+    A.nan_to_num_()
 
-    # sanitize NaN/Inf (rare, but cheap insurance)
-    A = torch.nan_to_num(A)
+    # The eigendecomposition is taken in float64
+    A64 = A if A.dtype == torch.float64 else A.to(torch.float64)
 
-    # do the heavy linear algebra in float64 for stability
-    if A.dtype != torch.float64:
-        A64 = A.to(torch.float64)
+    if (identity is not None
+            and identity.dtype == A64.dtype
+            and identity.device == A64.device
+            and identity.shape == A64.shape[-2:]):
+        I = identity
     else:
-        A64 = A
+        I = torch.eye(A64.shape[-1], device=A64.device, dtype=A64.dtype)
 
-    I = torch.eye(A64.shape[-1], device=A64.device, dtype=A64.dtype)
-
-    # base jitter scaled to matrix magnitude
     scale = A64.abs().mean()
     base = (scale if torch.isfinite(scale) and scale > 0 else 1.0)
     jitter = jitter0 * base
 
-    for _ in range(max_retries + 1):
+    last_attempt = max_retries + 1
+    for attempt in range(last_attempt + 1):
         try:
             evals, evecs = torch.linalg.eigh(A64 + jitter * I)
             evals = evals.clamp_min(0.0)
             out64 = (evecs * evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
             out64 = 0.5 * (out64 + out64.transpose(-1, -2))
             return out64.to(orig_dtype)
-        except RuntimeError as e:
-            # escalate jitter by x10 and retry
+        except RuntimeError as err:
+            if attempt == last_attempt:
+                raise RuntimeError(
+                    f"PSD projection failed after {attempt + 1} eigh attempts; "
+                    f"final jitter {float(jitter):.3e}."
+                ) from err
             jitter *= 10.0
-            continue
-
-    # last resort: project by zeroing negative eigenvalues via eigvalsh fallback
-    evals, evecs = torch.linalg.eigh(A64 + jitter * I)
-    evals = evals.clamp_min(0.0)
-    out64 = (evecs * evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
-    out64 = 0.5 * (out64 + out64.transpose(-1, -2))
-    return out64.to(orig_dtype)
 
 @torch.no_grad()
-def _SEC(
+def _SEC_dense(
     Rn: torch.Tensor,
     rho: float,
     *,
@@ -105,106 +163,151 @@ def _SEC(
     threshold: float = 0.1
 ) -> torch.Tensor:
     """
-    Sparse Estimation of the Correlation matrix (SEC) solver (APG + PSD projection),
-    adapted from the MATLAB reference implementation:
-      https://warwick.ac.uk/fac/sci/statistics/staff/academic-research/leng/publications/sec.m
+    Sparse estimation of a correlation matrix, dense output.
 
-    Solves (schematically):
-        min_R  0.5||R - Rn||_F^2 + rho * ||W ∘ R||_1
-        s.t.   R ⪰ epsilon*I,  R_ii = 1  (via calibration)
+    The problem solved is
+
+        min_R 0.5 * ||R - Rn||_F^2 + rho * ||W * R||_1
+        subject to R - epsilon * I positive semidefinite and R_ii = 1,
+
+    where W is the entrywise weight matrix W_ij = 1 / |Rn_ij| for |Rn_ij| > delta
+    and W_ij = 0 otherwise, and W * R is the entrywise product. The solver is an
+    accelerated proximal gradient scheme with Nesterov restarts and projection
+    onto the positive semidefinite cone at every iteration. The iterate is
+    rescaled to unit diagonal on exit and off-diagonal entries below threshold in
+    absolute value are set to zero.
+
+    Parameters
+    ----------
+    Rn : torch.Tensor
+        Square sample correlation matrix, dense or sparse COO.
+    rho : float
+        Penalty parameter of the weighted L1 term.
+    epsilon : float
+        Lower bound on the eigenvalues of the solution.
+    tol : float
+        Convergence tolerance on the relative gradient residual.
+    max_iter : int
+        Maximum number of proximal gradient iterations.
+    restart : int or None
+        Period of the Nesterov momentum restart. None or a value below 1
+        disables restarts.
+    line_search_apg : bool
+        If True, the step size is adapted from the residual history; otherwise a
+        fixed step size is used.
+    delta : float or None
+        Cutoff below which an off-diagonal entry of Rn is treated as zero. If
+        None, it is set to c_delta * sqrt(log(p) / n_samples) when n_samples is
+        given and to 1e-6 otherwise.
+    n_samples : int or None
+        Sample size used to derive delta.
+    c_delta : float
+        Constant in the expression for delta.
+    threshold : float
+        Hard threshold applied to the off-diagonal entries of the solution. A
+        value of zero or less disables thresholding.
+
+    Returns
+    -------
+    torch.Tensor
+        Dense symmetric matrix of shape (p, p) with unit diagonal up to the
+        epsilon offset.
+
+    Raises
+    ------
+    ValueError
+        If Rn is not square or if max_iter is less than one.
 
     Notes
     -----
-    * Uses an APG (accelerated proximal gradient) scheme with optional
-      Nesterov restarts and a simple backtracking-like linesearch toggle.
-    * PSD feasibility is enforced by projection onto the PSD cone.
-    * A final “calibration” rescales to (approx.) unit diagonal.
-    * At the very end, a hard threshold is applied and the result is
-      returned as a sparse COO tensor (diagonal kept).
+    The sample correlation matrix is standardized by column mean and column
+    standard deviation before the proximal gradient iterations. In Cui, Leng and
+    Sun (2016) the standardization applies to the data variables rather than to
+    the correlation matrix. The implementation retains the standardization of
+    the correlation matrix.
+
+    References
+    ----------
+    Cui, Y., Leng, C. and Sun, D. (2016). Sparse estimation of high-dimensional
+    correlation matrices. Computational Statistics and Data Analysis, 93, 390-403.
+    Reference implementation:
+    https://warwick.ac.uk/fac/sci/statistics/staff/academic-research/leng/publications/sec.m
     """
-    # --- basic checks and shapes ---
     if Rn.is_sparse:
         Rn = Rn.coalesce().to_dense()
-    assert Rn.ndim == 2 and Rn.shape[0] == Rn.shape[1], "Rn must be square."
+    if Rn.ndim != 2 or Rn.shape[0] != Rn.shape[1]:
+        raise ValueError(f"Rn must be square; got shape {tuple(Rn.shape)}.")
+    if max_iter < 1:
+        raise ValueError(f"max_iter must be at least 1; got {max_iter}.")
     p = Rn.shape[0]
     device, dtype = Rn.device, Rn.dtype
+    zero = Rn.new_zeros(())
 
-    # --- delta (theoretical tiny-entry cutoff) ---
-    # δ ≈ c_delta * sqrt(log p / n); falls back to a tiny numeric if n unknown.
+    # Cutoff below which an off-diagonal entry of Rn is treated as zero
     if delta is None:
         if n_samples is not None and n_samples > 0:
             delta = float(c_delta * math.sqrt(max(math.log(p) / n_samples, 0.0)))
         else:
             delta = 1e-6
 
-    # Dual/init vars
     Z = torch.zeros((p, p), device=device, dtype=dtype)
     b_vec = torch.ones((p,), device=device, dtype=dtype)
 
-    # --- masks from |Rn| and identity ---
     abs_Rn = torch.abs(Rn)
     eye_mask = torch.eye(p, device=device, dtype=torch.bool)
     offdiag_mask = ~eye_mask
-    tiny_mask = (abs_Rn < delta) & offdiag_mask # “very small” off-diagonals
-    Omega = eye_mask | tiny_mask # entries fixed to b (diag) or 0 (tiny)
-    
-    # Target b-matrix (diag = 1, tiny off-diagonals = 0 by construction)
-    b_mat = torch.diag(b_vec)
+    tiny_mask = (abs_Rn < delta) & offdiag_mask
+    W = torch.where(abs_Rn <= delta, zero, 1.0 / abs_Rn.clamp_min(1e-300))
+    W.fill_diagonal_(0.0)
 
-    # --- weights W: 0 where |Rn| <= δ; else 1/|Rn| ---
-    Wmat = torch.zeros((p, p), device=device, dtype=dtype)
-    Wmat = torch.where(abs_Rn <= delta, Wmat, 1.0 / abs_Rn.clamp_min(1e-300))
-    Wmat.fill_diagonal_(0.0)
-    W = Wmat
-
-    # --- preprocessing on Rn (centering & scaling by column) and symmetrize ---
-    Rn = Rn.to(device=device, dtype=dtype)
+    # Column standardization of Rn followed by symmetrization
     col_mean = Rn.mean(dim=0, keepdim=True)
     col_std = Rn.std(dim=0, unbiased=True, keepdim=True).clamp_min(1e-12)
     Rn_work = (Rn - col_mean) / col_std
     Rn_work = 0.5 * (Rn_work + Rn_work.T)
 
-    # --- APG state ---    
     R = torch.zeros((p, p), device=device, dtype=dtype)
-    Y = Z.clone()
+    Y = Z
     t = 1.0
     L = 1.0
     tau = 0.75
     eta = 0.9
     I = torch.eye(p, device=device, dtype=dtype)
+    rhoW = rho * W
+    epsI = epsilon * I
 
     res_old: Optional[float] = None
 
     for k in range(1, max_iter + 1):
-        Yold = Y.clone()
+        Yold = Y
         told = t
 
         X = Z + Rn_work
 
-        R_tmp = torch.sign(X) * torch.clamp(torch.abs(X) - rho * W, min=0.0)
-        R = R_tmp.clone()
-        R[Omega] = b_mat[Omega]
+        R = torch.sign(X) * torch.clamp(torch.abs(X) - rhoW, min=0.0)
+        R.masked_fill_(tiny_mask, 0.0)
+        R.diagonal().fill_(1.0)
         R = 0.5 * (R + R.T)
 
         if line_search_apg:
-            if (k % 5 == 0) and (tau < L) and (res_old is not None):
-                pass
-
-            Y = _projection_psd(Z - (R - epsilon * I) / tau)
+            Y = _projection_psd(Z - (R - epsI) / tau, identity=I)
             res_gradient = (tau * torch.linalg.norm(Z - Y, ord='fro') /
                             (1.0 + torch.linalg.norm(Z, ord='fro')))
-            if (k % 5 == 0) and (tau < L) and (res_old is not None) and (res_gradient > res_old):
-                tau = min(L, tau / eta)
         else:
-            Y = _projection_psd(Z - (R - epsilon * I) / L)
+            Y = _projection_psd(Z - (R - epsI) / L, identity=I)
             res_gradient = (torch.linalg.norm(Z - Y, ord='fro') /
                             (1.0 + torch.linalg.norm(Z, ord='fro')))
 
-        if k > 1:
-            res_old = float(res_gradient)
+        res_val = float(res_gradient)
 
-        # Early convergence
-        if float(res_gradient) <= tol:
+        if line_search_apg:
+            if (k % 5 == 0) and (tau < L) and (res_old is not None) and (res_val > res_old):
+                tau = min(L, tau / eta)
+
+        if k > 1:
+            res_old = res_val
+
+        if res_val <= tol:
             break
 
         if (restart is not None) and (restart > 0) and (k % restart == 0):
@@ -214,54 +317,117 @@ def _SEC(
         t = (1.0 + math.sqrt(1.0 + 4.0 * told * told)) / 2.0
         Z = Y + ((told - 1.0) / t) * (Y - Yold)
 
-    # Calibration
-    R_cal = R - epsilon * I
+    # Rescaling to unit diagonal
+    R_cal = R - epsI
     lam_min = torch.linalg.eigvalsh(R_cal).min().item()
     if lam_min < 0.0:
         R_cal = R_cal + (-lam_min) * I
 
-    d = torch.diag(R_cal).clamp_min(1e-300)
+    d = torch.diag(R_cal)
+    if bool((d <= 0).any()):
+        warnings.warn(
+            "The calibrated matrix has nonpositive diagonal entries; the "
+            "corresponding scaling factors are set to zero.",
+            RuntimeWarning
+        )
+    d = d.clamp_min(1e-300)
     d = ((b_vec - epsilon) / d).clamp_min(0.0).sqrt()
     D = torch.diag(d)
 
     R_out = D @ R_cal @ D
-    R_out = 0.5 * (R_out + R_out.T) + epsilon * I
-    
-    # --- postprocessing: hard threshold + sparse output --- 
-    # Keep symmetry and always keep the diagonal, even if threshold is large.
+    R_out = 0.5 * (R_out + R_out.T) + epsI
+
+    # Hard threshold on the off-diagonal entries, diagonal preserved
     if threshold > 0.0:
-        # keep diagonal exactly as produced by calibration
         diag_vals = R_out.diagonal().clone()
-        # zero out sub-threshold off-diagonals
-        R_out = torch.where(R_out.abs() >= threshold,
-                            R_out,
-                            torch.zeros_like(R_out))
-        # restore diagonal
+        R_out = torch.where(R_out.abs() >= threshold, R_out, zero)
         R_out.diagonal().copy_(diag_vals)
-    
-    return R_out.to_sparse_coo().coalesce()
+
+    return R_out
+
+@torch.no_grad()
+def _SEC(Rn: torch.Tensor, rho: float, **kwargs) -> torch.Tensor:
+    """
+    Sparse estimation of a correlation matrix, sparse output.
+
+    Parameters
+    ----------
+    Rn : torch.Tensor
+        Square sample correlation matrix, dense or sparse COO.
+    rho : float
+        Penalty parameter of the weighted L1 term.
+    **kwargs
+        Keyword arguments of _SEC_dense.
+
+    Returns
+    -------
+    torch.Tensor
+        Coalesced sparse COO tensor holding the solution of _SEC_dense.
+    """
+    return _SEC_dense(Rn, rho, **kwargs).to_sparse_coo().coalesce()
 
 @torch.no_grad()
 def _SEC_cv(
     X: torch.Tensor,
     Rn: torch.Tensor,
     *,
-    c_grid: Sequence[float] = tuple(float(x) for x in range(1, 11)),  # 1.0, 2.0, ..., 10.0 (coarse)
+    c_grid: Sequence[float] = tuple(float(x) for x in range(1, 11)),
     n_splits: int = 5,
     seed: int = 0,
-    workers: int = -1,             # only used on CPU
-    refine: bool = True,           # zoom after coarse pass
-    refine_points: int = 10,       # number of points in the refined bracket (inclusive)
+    workers: int = -1,
+    refine: bool = True,
+    refine_points: int = 10,
     **sec_kwargs
 ) -> Tuple[float, "pd.DataFrame", torch.Tensor]:
     """
-    Choose rho for SEC via K-fold cross-validation with a single adaptive refinement:
-    1) Evaluate coarse c_grid (e.g., 3..10).
-    2) Find best c and refine once between its immediate neighbors (left/right).
-    Returns (best_rho, scores_by_rho, R_hat_best_dense).
-    """
+    Select the penalty parameter of _SEC_dense by K-fold cross-validation.
 
-    assert X.ndim == 2, "X must be 2D (n x p)."
+    The penalty is parameterized as rho = c * sqrt(log(p) / n). The grid c_grid
+    is evaluated first, and the interval between the immediate neighbors of the
+    best c is then evaluated on refine_points equally spaced values. The
+    cross-validation score of a given rho is the mean over folds of the squared
+    Frobenius norm of the difference between the estimate on the training fold
+    and the sample correlation matrix of the validation fold.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Data matrix of shape (n, p).
+    Rn : torch.Tensor
+        Sample correlation matrix on all n observations, dense or sparse COO.
+    c_grid : sequence of float
+        Values of c evaluated in the first pass.
+    n_splits : int
+        Number of folds.
+    seed : int
+        Seed of the permutation defining the folds.
+    workers : int
+        Number of worker threads used on CPU. None or a negative value means one
+        worker per core. A value of one disables threading.
+    refine : bool
+        If True, a second pass is run between the neighbors of the best c.
+    refine_points : int
+        Number of equally spaced values in the refined interval.
+    **sec_kwargs
+        Keyword arguments of _SEC_dense.
+
+    Returns
+    -------
+    best_rho : float
+        Penalty with the smallest score, ties broken by the smaller rho.
+    scores_df : pandas.DataFrame
+        Columns c, rho and score, sorted by rho.
+    R_hat_best : torch.Tensor
+        Dense estimate obtained at best_rho from Rn.
+
+    Raises
+    ------
+    ValueError
+        If X is not two-dimensional, if n_splits is outside [2, n], or if a
+        correlation matrix or an estimate has non-finite entries.
+    """
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D (n x p); got shape {tuple(X.shape)}.")
     n, p = X.shape
     device, dtype = X.device, X.dtype
 
@@ -272,7 +438,7 @@ def _SEC_cv(
     def c_to_rho(c: float) -> float:
         return float(c) * base
 
-    # Build K folds (deterministic)
+    # Deterministic folds
     idx = torch.arange(n, device='cpu')
     g = torch.Generator(device='cpu').manual_seed(int(seed))
     perm = idx[torch.randperm(n, generator=g)]
@@ -289,57 +455,52 @@ def _SEC_cv(
         folds.append((train_idx, val_idx))
         start += fs
 
-    # Pre-cache validation correlations
+    # Fold correlation matrices, computed once
+    R_tr_list = []
     R_val_list = []
-    for _, val_idx in folds:
+    for train_idx, val_idx in folds:
+        X_tr = X.index_select(0, train_idx.to(X.device))
+        R_tr = _compute_correlation(X_tr).coalesce().to_dense()
+        if not torch.isfinite(R_tr).all():
+            raise ValueError("R_tr had non-finite entries")
+        R_tr_list.append(R_tr)
         X_val = X.index_select(0, val_idx.to(X.device))
         R_val = _compute_correlation(X_val).coalesce().to_dense()
-        assert torch.isfinite(R_val).all(), "R_val had non-finite entries"
+        if not torch.isfinite(R_val).all():
+            raise ValueError("R_val had non-finite entries")
         R_val_list.append(R_val)
 
-    def _score_one_rho(rho: float) -> Tuple[float, float]:
+    def _score_one_rho(rho: float) -> float:
         errs = []
-        for (train_idx, _), R_val in zip(folds, R_val_list):
-            X_tr = X.index_select(0, train_idx.to(X.device))
-            R_tr = _compute_correlation(X_tr).coalesce().to_dense()
-            assert torch.isfinite(R_tr).all(), "R_tr had non-finite entries"
-            R_hat_sparse = _SEC(Rn=R_tr, rho=rho, **sec_kwargs)
-            R_hat = R_hat_sparse.to_dense()
-            assert torch.isfinite(R_hat).all(), "R_hat had non-finite entries"
+        for R_tr, R_val in zip(R_tr_list, R_val_list):
+            R_hat = _SEC_dense(Rn=R_tr, rho=rho, **sec_kwargs)
+            if not torch.isfinite(R_hat).all():
+                raise ValueError("R_hat had non-finite entries")
             diff = (R_hat - R_val).to(dtype)
             err = torch.linalg.norm(diff, ord='fro') ** 2
             errs.append(float(err.item()))
-        return rho, float(sum(errs) / len(errs))
+        return float(sum(errs) / len(errs))
 
-    # Storage for results and quick lookup by rho
     rows: List[Dict[str, float]] = []
-    scores_by_rho: Dict[float, float] = {}  # rho -> score
+    scores_by_rho: Dict[float, float] = {}
 
     def _score_many_pairs(c_list: Sequence[float]) -> None:
-        """Score a batch of c's (and their rhos), append rows, and fill scores_by_rho."""
         rhos_batch = [c_to_rho(c) for c in c_list]
         if device.type == "cpu" and (workers is None or workers < 0 or workers > 1):
             max_workers = (os.cpu_count() or 1) if workers in (None, -1) else int(workers)
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                # Map each future directly to its (c, r) so we can recover them safely.
-                futures = {ex.submit(_score_one_rho, r): (c, r) for c, r in zip(c_list, rhos_batch)}
-                for fut in as_completed(futures):
-                    c, r = futures[fut]
-                    r_ret, score = fut.result()  # r_ret should equal r
-                    # Use r_ret from the result to avoid any mismatch
-                    scores_by_rho[r_ret] = score
-                    rows.append({"c": float(c), "rho": float(r_ret), "score": float(score)})
+            # One intra-op thread budget per worker
+            with _thread_limit(max(1, (os.cpu_count() or 1) // max_workers)):
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    scores = list(ex.map(_score_one_rho, rhos_batch))
         else:
-            for c, r in zip(c_list, rhos_batch):
-                r_ret, score = _score_one_rho(r)
-                scores_by_rho[r_ret] = score
-                rows.append({"c": float(c), "rho": float(r_ret), "score": float(score)})
+            scores = [_score_one_rho(r) for r in rhos_batch]
+        for c, r, score in zip(c_list, rhos_batch, scores):
+            scores_by_rho[r] = score
+            rows.append({"c": float(c), "rho": float(r), "score": float(score)})
 
-    # ---- Coarse pass
     c_coarse = sorted(set(float(c) for c in c_grid))
     _score_many_pairs(c_coarse)
 
-    # Helper to pick best c from a list of c's using scores_by_rho
     def _best_c_from(c_list: Sequence[float]) -> float:
         best_c = None
         best_score = None
@@ -352,7 +513,6 @@ def _SEC_cv(
 
     best_c_coarse = _best_c_from(c_coarse)
 
-    # ---- Single refinement (between immediate neighbors)
     if refine and refine_points >= 2 and len(c_coarse) >= 2:
         i = c_coarse.index(best_c_coarse)
         if i == 0:
@@ -365,16 +525,15 @@ def _SEC_cv(
         if c_right > c_left:
             step = (c_right - c_left) / (refine_points - 1)
             c_refined = [c_left + j * step for j in range(refine_points)]
-            # Skip any c we already evaluated in coarse
-            c_new = [c for c in c_refined if c not in c_coarse]
+            # Values already evaluated in the first pass are skipped
+            coarse_keys = {round(c, 12) for c in c_coarse}
+            c_new = [c for c in c_refined if round(c, 12) not in coarse_keys]
             if c_new:
                 _score_many_pairs(c_new)
 
-    # ---- Final selection across all evaluated rhos
     best_rho = min(scores_by_rho.items(), key=lambda kv: (kv[1], kv[0]))[0]
-    
-    # --- Edge warning (relative to the provided coarse c_grid)
-    # Only meaningful when base > 0 so that c = rho/base is defined.
+
+    # Warning when the selected c sits at an edge of c_grid
     if base > 0.0:
         best_c = best_rho / base
         c_min, c_max = c_coarse[0], c_coarse[-1]
@@ -391,19 +550,8 @@ def _SEC_cv(
                 RuntimeWarning
             )
 
-    # Final fit at best_rho on full-sample correlation
-    Rn_dense = Rn.coalesce().to_dense() if getattr(Rn, "is_sparse", False) and Rn.is_sparse else Rn
-    R_hat_best = _SEC(Rn=Rn_dense, rho=best_rho, **sec_kwargs)
+    # Final fit at best_rho on the full-sample correlation matrix
+    R_hat_best = _SEC_dense(Rn=Rn, rho=best_rho, **sec_kwargs)
 
-    # Make DataFrame
     scores_df = pd.DataFrame(rows).sort_values("rho", kind="mergesort").reset_index(drop=True)
-    return best_rho, scores_df, R_hat_best.to_dense()
-
-
-
-
-
-
-
-
-
+    return best_rho, scores_df, R_hat_best

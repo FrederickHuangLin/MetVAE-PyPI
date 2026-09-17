@@ -4,67 +4,104 @@ from typing import Optional, Tuple
 # Helper functions for missing value imputation
 
 def _build_X(
-        meta: Optional[torch.Tensor], 
-        n: int, dtype: torch.dtype, 
+        meta: Optional[torch.Tensor],
+        n: int, dtype: torch.dtype,
         device: torch.device
         ) -> torch.Tensor:
+    """
+    Build the design matrix with an intercept column.
+
+    Parameters
+    ----------
+    meta : torch.Tensor or None
+        Covariate matrix of shape (n, p) or (n,). None gives an intercept-only
+        design.
+    n : int
+        Number of observations.
+    dtype : torch.dtype
+        Dtype of the returned matrix.
+    device : torch.device
+        Device of the returned matrix.
+
+    Returns
+    -------
+    torch.Tensor
+        Design matrix of shape (n, p + 1).
+    """
     if meta is None:
-        return torch.ones(n, 1, dtype=dtype, device=device)     # intercept only
+        return torch.ones(n, 1, dtype=dtype, device=device)
     X = meta.to(dtype=dtype, device=device)
     if X.ndim == 1:
         X = X.unsqueeze(1)
-    return torch.cat([torch.ones(n, 1, dtype=dtype, device=device), X], dim=1)  # add intercept
+    return torch.cat([torch.ones(n, 1, dtype=dtype, device=device), X], dim=1)
 
 def _ols_estimate(
-        Y: torch.Tensor,                      # (n, d) with NaNs marking “missing”
-        meta: Optional[torch.Tensor] = None,  # None or (n, p)
-        ridge_eps: float = 1e-8,              # optional tiny ridge like 1e-8 for stability
-        cond_warn: float = 1e12               # ill-conditioning threshold
+        Y: torch.Tensor,
+        meta: Optional[torch.Tensor] = None,
+        ridge_eps: float = 1e-8,
+        cond_warn: float = 1e12,
+        chunk_bytes: int = 256 * 1024 * 1024
         ) -> torch.Tensor:
     """
-    Batched OLS handling NaNs per column via weights W = 1{observed}.
-    Returns zeros for columns that cannot be estimated.
-    
-    Returns:
-        estimates: (p'+1, d) = [beta rows; log(scale)]
+    Weighted least squares fit of each column of Y on a common design matrix.
+
+    A missing entry of Y is marked by NaN and receives weight zero. The residual
+    scale is computed on the observed rows only. Columns that cannot be
+    estimated are returned as zero.
+
+    Parameters
+    ----------
+    Y : torch.Tensor
+        Response matrix of shape (n, d) with NaN marking missing entries.
+    meta : torch.Tensor or None
+        Covariate matrix of shape (n, p). None gives an intercept-only design.
+    ridge_eps : float
+        Ridge term added to the diagonal of each normal-equation matrix.
+    cond_warn : float
+        Condition number above which a column is treated as not estimable.
+    chunk_bytes : int
+        Memory budget of the intermediate weighted design used to accumulate the
+        normal equations.
+
+    Returns
+    -------
+    torch.Tensor
+        Estimates of shape (p + 2, d) holding the regression coefficients in the
+        leading rows and log(sigma) in the last row.
     """
     device, dtype = Y.device, Y.dtype
     n, d = Y.shape
 
-    # --- Design matrix with intercept ---
-    X = _build_X(meta, n, dtype, device)    # (n, p')
+    X = _build_X(meta, n, dtype, device)
     p_prime = X.shape[1]
 
-    # --- Weights & filled Y ---
-    W = (~torch.isnan(Y)).to(dtype=dtype)   # (n, d) 1 if observed else 0
-    Y_filled = torch.nan_to_num(Y, nan=0.0) # (n, d)
+    W = (~torch.isnan(Y)).to(dtype=dtype)
+    Y_filled = torch.nan_to_num(Y, nan=0.0)
 
-    # --- Compute XtWX and XtWy in batch WITHOUT einsum bugs ---
-    # For each feature j: XtWX_j = X^T (diag(w_j) X) = X^T (X * w_j[:,None])
-    X_t = X.transpose(0, 1)                               # (p', n)
-    Xw = X.unsqueeze(2) * W.unsqueeze(1)                  # (n, p', d)
-    # Bring feature dim forward: (d, n, p')
-    Xw_d = Xw.permute(2, 0, 1)                            # (d, n, p')
-    # Batched matmul: (1, p', n) @ (d, n, p') -> (d, p', p')  (broadcast on leading dim)
-    XtWX = torch.matmul(X_t.unsqueeze(0), Xw_d)           # (d, p', p')
-    # (p', d): X^T (W * Y)
-    XtWy = X_t @ (W * Y_filled)                           # (p', d)
+    # Normal equations per column, accumulated over chunks of columns
+    X_t = X.transpose(0, 1)
+    itemsize = torch.finfo(dtype).bits // 8
+    chunk = max(1, int(chunk_bytes) // max(1, n * p_prime * itemsize))
+    XtWX = torch.empty((d, p_prime, p_prime), dtype=dtype, device=device)
+    for j0 in range(0, d, chunk):
+        j1 = min(j0 + chunk, d)
+        Xw_d = (X.unsqueeze(2) * W[:, j0:j1].unsqueeze(1)).permute(2, 0, 1)
+        XtWX[j0:j1] = torch.matmul(X_t.unsqueeze(0), Xw_d)
+    XtWy = X_t @ (W * Y_filled)
 
-    # Optional ridge (stabilize if badly conditioned)
     if ridge_eps > 0:
-        I = torch.eye(p_prime, dtype=dtype, device=device).unsqueeze(0) # (1, p', p')
-        XtWX = XtWX + ridge_eps * I                                     # (d, p', p')
+        I = torch.eye(p_prime, dtype=dtype, device=device).unsqueeze(0)
+        XtWX = XtWX + ridge_eps * I
 
-    # --- Solve (XtWX_j) beta_j = XtWy_j for all j ---
-    A = XtWX                                                         # (d, p', p')
-    B = XtWy.T.unsqueeze(2)                                          # (d, p', 1)
+    A = XtWX
+    B = XtWy.T.unsqueeze(2)
 
-    # Condition numbers (per feature) for diagnostics
-    svals = torch.linalg.svdvals(A)                                  # (d, min(p',p'))
-    cond = (svals[..., 0] / svals[..., -1].clamp_min(torch.finfo(dtype).eps))  # (d,)
+    # Singular values give both the condition number and the rank
+    svals = torch.linalg.svdvals(A)
+    cond = (svals[..., 0] / svals[..., -1].clamp_min(torch.finfo(dtype).eps))
+    rank = (svals > p_prime * torch.finfo(dtype).eps * svals[..., :1]).sum(-1)
 
-    beta_d = torch.zeros_like(B)                                     # (d, p', 1)
-    # Try direct solve where well-conditioned; fallback to pinv
+    beta_d = torch.zeros_like(B)
     well = torch.isfinite(cond) & (cond < 1/torch.finfo(dtype).eps)
     if well.any():
         beta_d[well] = torch.linalg.solve(A[well], B[well])
@@ -72,26 +109,21 @@ def _ols_estimate(
         A_pinv = torch.linalg.pinv(A[~well])
         beta_d[~well] = A_pinv @ B[~well]
 
-    beta = beta_d.squeeze(2).T                                       # (p', d)
+    beta = beta_d.squeeze(2).T
 
-    # --- Residuals / scale computed on observed rows only ---
-    Y_hat = X @ beta                                                 # (n, d)
+    Y_hat = X @ beta
     resid = torch.where(W.bool(), Y_filled - Y_hat, torch.zeros_like(Y_filled))
-    sse = (resid ** 2).sum(dim=0)                                    # (d,)
+    sse = (resid ** 2).sum(dim=0)
 
-    # df_resid per column: (#observed_j - rank_j), clamp at 1
-    # Rank of XtWX_j equals rank of masked design for column j
-    rank = torch.linalg.matrix_rank(A)                               # (d,)
-    n_obs = W.sum(dim=0)                                             # (d,)
+    n_obs = W.sum(dim=0)
     df_resid = torch.clamp((n_obs - rank).to(dtype=dtype), min=1)
 
-    scale = sse / df_resid                                           # (d,)
-    log_scale = torch.log(scale).unsqueeze(0)                        # (1, d)
+    scale = sse / df_resid
+    log_sigma = (0.5 * torch.log(scale)).unsqueeze(0)
 
-    estimates = torch.cat([beta, log_scale], dim=0)                  # (p'+1, d)
-    
-    # --- Identify bad columns and zero them out ---
-    # Reasons: any NaN/Inf, ill-conditioned, rank deficiency, or too few obs (< p')
+    estimates = torch.cat([beta, log_sigma], dim=0)
+
+    # Columns that are not estimable are set to zero
     per_col_bad = torch.isnan(estimates).any(dim=0) | torch.isinf(estimates).any(dim=0)
     ill = cond > cond_warn
     low_rank = rank < p_prime
@@ -105,23 +137,54 @@ def _ols_estimate(
 
 @torch.no_grad()
 def _tobit_em_warmstart(
-    Y: torch.Tensor,                 # (n, d), NaN marks left-censored
-    meta: Optional[torch.Tensor],    # None or (n, p)
-    th: torch.Tensor,                # (n, d) or broadcastable to it
-    init_estimates: torch.Tensor,    # (p′+1, d) from your OLS initializer (rows: beta; log(scale))
+    Y: torch.Tensor,
+    meta: Optional[torch.Tensor],
+    th: torch.Tensor,
+    init_estimates: torch.Tensor,
     steps: int = 20,
     tol: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Batched EM for censored normal (Tobit). Returns estimates stacked by rows:
-    (p′+1, d) = [beta rows; log(sigma)].
+    Expectation maximization for the left-censored normal model.
+
+    Parameters
+    ----------
+    Y : torch.Tensor
+        Response matrix of shape (n, d) with NaN marking a left-censored entry.
+    meta : torch.Tensor or None
+        Covariate matrix of shape (n, p). None gives an intercept-only design.
+    th : torch.Tensor
+        Censoring thresholds, broadcastable to the shape of Y.
+    init_estimates : torch.Tensor
+        Starting values of shape (p + 2, d) holding the regression coefficients
+        in the leading rows and log(sigma) in the last row.
+    steps : int
+        Maximum number of iterations.
+    tol : float
+        Relative change of the monitored objective below which the iteration
+        stops.
+
+    Returns
+    -------
+    X : torch.Tensor
+        Design matrix of shape (n, p + 1).
+    th : torch.Tensor
+        Censoring thresholds broadcast to the shape of Y.
+    beta : torch.Tensor
+        Regression coefficients of shape (p + 1, d).
+    log_sigma : torch.Tensor
+        Logarithm of the residual standard deviation, shape (1, d).
+
+    Raises
+    ------
+    ValueError
+        If init_estimates does not have shape (p + 2, d).
     """
     device, dtype = Y.device, Y.dtype
     n, d = Y.shape
-    X = _build_X(meta, n, dtype, device)             # (n, p′)
+    X = _build_X(meta, n, dtype, device)
     p_prime = X.shape[1]
 
-    # Broadcast threshold to (n, d)
     th = th.to(dtype=dtype, device=device)
     if th.ndim == 0:
         th = th.expand_as(Y)
@@ -130,18 +193,20 @@ def _tobit_em_warmstart(
     else:
         th = th.expand_as(Y)
 
-    # Masks
-    unc = ~torch.isnan(Y)                             # (n, d)
+    unc = ~torch.isnan(Y)
     cens = ~unc
 
-    # Initial parameters from OLS: last row is log(scale) with scale = sigma^2
     est0 = init_estimates.to(dtype=dtype, device=device)
-    assert est0.shape == (p_prime + 1, d), f"init_estimates must be {(p_prime+1, d)}"
-    beta = est0[:-1, :]                               # (p′, d)
-    sigma = torch.exp(0.5 * est0[-1:, :]).clamp_min(1e-8)  # (1, d)  sigma = sqrt(scale)
+    if est0.shape != (p_prime + 1, d):
+        raise ValueError(
+            f"init_estimates must have shape {(p_prime + 1, d)}; "
+            f"got {tuple(est0.shape)}."
+        )
+    beta = est0[:-1, :]
+    sigma = torch.exp(est0[-1:, :]).clamp_min(1e-8)
 
-    # Precompute QR for fast OLS each M-step: beta = R^{-1} Q^T Ybar
-    Q, R = torch.linalg.qr(X, mode="reduced")         # Q: (n,p′), R: (p′,p′)
+    # QR of the design matrix for the least squares step of each iteration
+    Q, R = torch.linalg.qr(X, mode="reduced")
 
     normal = torch.distributions.Normal(
         loc=torch.zeros((), device=device, dtype=dtype),
@@ -151,42 +216,35 @@ def _tobit_em_warmstart(
     prev_obj = torch.tensor(float("inf"), device=device, dtype=dtype)
 
     for it in range(steps):
-        # ----- E-step using current (beta, sigma) -----
-        mu = X @ beta                                  # (n, d)
-        a = (th - mu) / sigma                          # (n, d)
-        # Clamp Phi to avoid 0; pdf is fine
+        # E-step
+        mu = X @ beta
+        a = (th - mu) / sigma
         Phi = normal.cdf(a).clamp_min(torch.finfo(dtype).eps)
         phi = torch.exp(normal.log_prob(a))
-        lam = (phi / Phi)                              # (n, d)
+        lam = (phi / Phi)
 
-        # Expected y* for censored; observed y for uncensored
-        y_bar = torch.where(unc, Y, mu - sigma * lam)  # (n, d)
+        # Conditional mean of the latent response
+        y_bar = torch.where(unc, Y, mu - sigma * lam)
 
-        # Var term for censored: E[(y*-mu)^2 | cens, old]
-        var_cens = (sigma ** 2) * (1.0 - a * lam - lam * lam)  # (n, d)
+        # Conditional variance of the latent response at a censored entry
+        var_cens = (sigma ** 2) * (1.0 - a * lam - lam * lam)
 
-        # ----- M-step -----
-        # Update beta (OLS on y_bar) using precomputed QR
-        QtY = Q.transpose(0, 1) @ y_bar               # (p′, d)
-        beta_new = torch.linalg.solve_triangular(R, QtY, upper=True)  # (p′, d)
+        # M-step
+        QtY = Q.transpose(0, 1) @ y_bar
+        beta_new = torch.linalg.solve_triangular(R, QtY, upper=True)
 
-        # Update sigma (per feature)
-        mu_new = X @ beta_new                         # (n, d)
-        # Uncensored residuals
+        mu_new = X @ beta_new
         res_unc = torch.where(unc, (Y - mu_new), torch.zeros_like(Y))
-        sse_unc = (res_unc ** 2).sum(dim=0)           # (d,)
+        sse_unc = (res_unc ** 2).sum(dim=0)
 
-        # Censored expected squared residuals:
-        # E[(y* - mu_new)^2] = Var_old + (E[y*]_old - mu_new)^2
         mean_offset2 = torch.where(cens, (y_bar - mu_new) ** 2, torch.zeros_like(Y))
         var_term = torch.where(cens, var_cens, torch.zeros_like(Y))
-        sse_cens = (mean_offset2 + var_term).sum(dim=0)   # (d,)
+        sse_cens = (mean_offset2 + var_term).sum(dim=0)
 
-        sse_total = sse_unc + sse_cens                    # (d,)
-        sigma_new = torch.sqrt((sse_total / n).clamp_min(1e-16)).unsqueeze(0)  # (1, d)
+        sse_total = sse_unc + sse_cens
+        sigma_new = torch.sqrt((sse_total / n).clamp_min(1e-16)).unsqueeze(0)
 
-        # Convergence check (relative change in params or obj)
-        # Use total negative Q-function proxy: sum of sse_total + log(sigma) terms
+        # Monitored quantity: total expected sum of squares plus summed log(sigma)
         obj = sse_total.sum() + torch.log(sigma_new).sum()
         rel_change = torch.abs(obj - prev_obj) / (torch.abs(prev_obj) + 1e-12)
         prev_obj = obj
@@ -198,10 +256,10 @@ def _tobit_em_warmstart(
     return X, th, beta, torch.log(sigma)
 
 def _fit_censored_normal(
-    Y: torch.Tensor,                       # (n, d), NaN marks censored obs
-    meta: Optional[torch.Tensor],          # None or (n, p) (intercept added inside)
-    th: torch.Tensor,                      # (n,) or (n,1) censoring thresholds (same scale as Y)
-    init_estimates: torch.Tensor,          # (p'+1, d) from _ols_estimate = [beta; log(variance)]
+    Y: torch.Tensor,
+    meta: Optional[torch.Tensor],
+    th: torch.Tensor,
+    init_estimates: torch.Tensor,
     max_iter: int = 100,
     tol: float = 1e-6,
     sigma_floor: float = 1e-6,
@@ -209,45 +267,68 @@ def _fit_censored_normal(
     em_steps: int = 20
 ) -> torch.Tensor:
     """
-    Vectorized censored Normal (Tobit) MLE via LBFGS, initialized from _ols_estimate.
-    Returns (beta_hat, sigma_hat, estimates) where estimates = [beta_hat; log(sigma_hat^2)].
+    Maximum likelihood fit of the left-censored normal model by LBFGS.
+
+    The optimizer is started from the expectation maximization solution returned
+    by _tobit_em_warmstart. If the optimizer raises, the starting values are
+    returned. Non-finite entries of the solution are replaced by the
+    corresponding entries of init_estimates.
+
+    Parameters
+    ----------
+    Y : torch.Tensor
+        Response matrix of shape (n, d) with NaN marking a left-censored entry.
+    meta : torch.Tensor or None
+        Covariate matrix of shape (n, p). None gives an intercept-only design.
+    th : torch.Tensor
+        Censoring thresholds, broadcastable to the shape of Y.
+    init_estimates : torch.Tensor
+        Starting values of shape (p + 2, d) holding the regression coefficients
+        in the leading rows and log(sigma) in the last row.
+    max_iter : int
+        Maximum number of LBFGS iterations.
+    tol : float
+        Tolerance on the gradient and on the parameter change.
+    sigma_floor : float
+        Lower bound on the residual standard deviation.
+    line_search : str
+        Line search used by LBFGS.
+    em_steps : int
+        Maximum number of expectation maximization iterations.
+
+    Returns
+    -------
+    torch.Tensor
+        Estimates of shape (p + 2, d) holding the regression coefficients in the
+        leading rows and log(sigma) in the last row.
     """
     device, dtype = Y.device, Y.dtype
-    n, d = Y.shape
-    mask_obs = ~torch.isnan(Y)                           # (n, d)
-    
-    # --- Unpack initial estimates ---
+    mask_obs = ~torch.isnan(Y)
+
     X, thu, beta0, logsigma0 = _tobit_em_warmstart(
-        Y=Y, meta=meta, th=th, 
-        init_estimates=init_estimates, 
+        Y=Y, meta=meta, th=th,
+        init_estimates=init_estimates,
         steps=em_steps, tol=tol
     )
-    
-    p_prime = X.shape[1] # X shape: (n, p')
-    
-    # --- Validate init_estimates ---
-    est0 = init_estimates.to(dtype=dtype, device=device)
-    assert est0.shape == (p_prime + 1, d), f"init_estimates must be {(p_prime + 1, d)}"
 
-    # Trainable parameters: stack [beta; rho]
-    params = torch.nn.Parameter(torch.cat([beta0, logsigma0], dim=0).clone())  # (p′ + 1, d)
+    est0 = init_estimates.to(dtype=dtype, device=device)
+
+    params = torch.nn.Parameter(torch.cat([beta0, logsigma0], dim=0).clone())
 
     def nll():
-        beta = params[:-1, :]                         # (p′, d)
-        logsigma = params[-1:, :]                     # (1, d)
-        sigma = torch.exp(logsigma).clamp_min(sigma_floor)  # (1, d)
-        inv_sigma = 1.0 / sigma                       # (1, d)
-        
-        mu = X @ beta                                 # (n, d)
+        beta = params[:-1, :]
+        logsigma = params[-1:, :]
+        sigma = torch.exp(logsigma).clamp_min(sigma_floor)
+        inv_sigma = 1.0 / sigma
 
-        # --- Uncensored observations ---
+        mu = X @ beta
+
         U = mask_obs
         e = torch.where(U, Y - mu, torch.zeros_like(Y))
         ll_unc = (U * (-torch.log(sigma) - 0.5 * (e * inv_sigma) ** 2)).sum()
 
-        # --- Censored observations ---
         C = ~U
-        z = (th - mu) * inv_sigma                     # (n, d)
+        z = (th - mu) * inv_sigma
         zC = torch.masked_select(z, C)
         ll_cens = torch.special.log_ndtr(zC).sum() if zC.numel() > 0 else torch.zeros((), device=device, dtype=dtype)
 
@@ -270,24 +351,12 @@ def _fit_censored_normal(
     try:
         optimizer.step(closure)
     except Exception:
-        # Fallback to EM-only result if LBFGS fails
         with torch.no_grad():
             params.copy_(torch.cat([beta0, logsigma0], dim=0))
 
-    # --- Extract estimates ---
     params = params.detach()
 
-    # Safety: replace any NaN/Inf with 0
     bad = ~torch.isfinite(params)
     if bad.any():
         params[bad] = est0[bad]
     return params
-    
-    
-    
-    
-    
-    
-    
-    
-    
