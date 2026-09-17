@@ -2,20 +2,17 @@ import os
 import warnings
 from typing import Optional, Iterable, Dict, List, Literal, Sequence
 import random
-import math
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import pdist, squareform
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from joblib import Parallel, delayed, parallel_backend
 from .vae import VAE
-from .utils import _make_valid_column_name, _torch_to_df, _corr_to_long
+from .utils import _make_valid_column_name, _torch_to_df, _corr_to_long, _thread_limit
 from .impute_missing import _ols_estimate, _fit_censored_normal
-from .compute_corr import _compute_correlation
-from .sparse import _matrix_p_adjust, _p_filter, _SEC, _SEC_cv
+from .compute_corr import _compute_correlation, _compute_correlation_dense
+from .sparse import _matrix_p_adjust, _p_filter, _SEC_dense, _SEC_cv
 
 def _data_pre_process(
         data: pd.DataFrame,
@@ -72,42 +69,34 @@ def _data_pre_process(
 
     Notes
     -----
-    The function performs several key steps:
-    1. Data validation and organization
-    2. Zero handling and CLR transformation
-    3. Parameter estimation with censoring for zero values
-    4. Covariate adjustment if metadata is provided
-    5. Conversion to PyTorch tensors for downstream analysis
+    Zeros are represented as NaN on the CLR scale. Feature means, standard deviations and
+    covariate coefficients are estimated by a censored normal model when zeros are present
+    and by ordinary least squares otherwise.
     """
-    # --- Input Validation and Data Organization ---
     dev = torch.device(device) if device is not None else torch.device("cpu")
 
     if not isinstance(data, pd.DataFrame):
         raise TypeError('The input data must be a pandas.DataFrame')
 
-    # Ensure features are columns for consistent processing
     if features_as_rows:
         data = data.T
 
-    # Align metadata
     if meta is not None:
         if not isinstance(meta, pd.DataFrame):
             raise TypeError('The meta data must be a pandas.DataFrame or None')
 
-        # Keep only metadata rows that appear in data (and preserve order of data)
         missing = set(data.index) - set(meta.index)
         if missing:
             raise ValueError(f"The following sample names are missing in the sample meta data: {missing}")
         meta = meta.loc[data.index]
 
-    # --- Zero-proportion filtering ---
+    # Drop features and samples whose proportion of zeros exceeds the thresholds.
     n0, d0 = data.shape
     print(f"Start: samples={n0}, features={d0}")
 
-    # Treat NaNs as zeros for the sparsity calculation
+    # NaNs count as zeros for the sparsity calculation.
     data_zeros_view = data.fillna(0)
 
-    # (1) Feature filtering by zeros proportion
     if feature_zero_threshold is not None:
         feat_zero_prop = (data_zeros_view.eq(0)).mean(axis=0)  # per feature
         feat_drop_mask = feat_zero_prop > feature_zero_threshold
@@ -118,9 +107,7 @@ def _data_pre_process(
         else:
             print(f"Filtered features: removed 0 (threshold {feature_zero_threshold:.2f})")
 
-    # (2) Sample filtering by zeros proportion (optional)
     if sample_zero_threshold is not None:
-        # recompute view after feature filtering
         data_zeros_view = data.fillna(0)
         samp_zero_prop = (data_zeros_view.eq(0)).mean(axis=1)  # per sample
         samp_drop_mask = samp_zero_prop > sample_zero_threshold
@@ -138,16 +125,12 @@ def _data_pre_process(
     n1, d1 = data.shape
     print(f"After zero filtering: samples={n1}, features={d1}")
 
-    # --- Names (after filtering) ---
     sample_name = data.index.tolist()
     feature_name = data.columns.tolist()
 
-    # --- Convert to torch & basic cleaning ---
     tdata = torch.tensor(data.values, dtype=dtype, device=dev)
-    # treat NaNs as zeros
     tdata = torch.nan_to_num(tdata, nan=0.0)
 
-    # Check for and fix negative values
     neg_mask = tdata < 0
     num_neg = int(neg_mask.sum().item())
     if num_neg > 0:
@@ -158,7 +141,6 @@ def _data_pre_process(
         )
         tdata = torch.where(neg_mask, torch.zeros_like(tdata), tdata)
 
-    # Discard rows that are all-zero
     row_all_zero = (tdata == 0).all(dim=1)
     if row_all_zero.any():
         keep_idx = ~row_all_zero
@@ -171,22 +153,18 @@ def _data_pre_process(
     n, d = tdata.shape
     print(f"Post-cleaning (convert negative values to zeros and drop all-zero samples): samples={n}, features={d}")
 
-    # Count zeros in each feature (torch)
     num_zero = (tdata == 0).sum(dim=0).float()
 
-    # --- Metadata Processing and Validation ---
+    # Assemble the covariate matrix, one-hot encoding the categorical covariates.
     if meta is not None:
-        # Handle continuous covariates
         smd_cont = meta.loc[:, continuous_covariate_keys] if continuous_covariate_keys is not None else None
 
-        # Categorical (one-hot)
         smd_cat = None
         if categorical_covariate_keys is not None:
             smd_cat = meta.loc[:, categorical_covariate_keys].apply(lambda x: x.astype('category'))
             smd_cat = pd.get_dummies(smd_cat, drop_first=True, dtype=float)
             smd_cat.columns = [_make_valid_column_name(c) for c in smd_cat.columns]
 
-        # Combine
         if smd_cont is not None and smd_cat is not None:
             smd_df = pd.concat([smd_cont, smd_cat], axis=1)
             confound_name = smd_df.columns.tolist()
@@ -210,7 +188,7 @@ def _data_pre_process(
         smd = None
         p = 1
 
-    # --- CLR Transformation ---
+    # Center the log data by sample; zeros become NaN.
     log_data = torch.where(
         tdata > 0, torch.log(tdata),
         torch.tensor(float('nan'), dtype=tdata.dtype, device=dev)
@@ -218,15 +196,13 @@ def _data_pre_process(
     shift = torch.nanmean(log_data, dim=1, keepdim=True)
     clr_data = log_data - shift
 
-    # Threshold values (per-feature min positive)
+    # Per-feature smallest positive value, used as the censoring threshold.
     th_raw = torch.where(tdata > 0, tdata, torch.tensor(float('inf'), dtype=tdata.dtype, device=dev)).min(dim=0).values
     th_raw = torch.where(th_raw == float('inf'), torch.tensor(1e-5, dtype=tdata.dtype, device=dev), th_raw)
     clr_th = torch.log(th_raw) - shift
 
-    # --- Parameter Estimation ---
     init_params = _ols_estimate(clr_data, smd)  # (p+1, d)
 
-    # --- Handle zeros via censored normal, else use init ---
     if torch.any(num_zero != 0):
         clr_params = _fit_censored_normal(
             clr_data, smd, clr_th,
@@ -240,7 +216,6 @@ def _data_pre_process(
     clr_sd = torch.exp(clr_log_sd)
     clr_mean = clr_params[0, :]
 
-    # Deconfound if metadata present
     if smd is not None:
         clr_coef = clr_params[1:p, :]
         clr_data = clr_data - smd @ clr_coef
@@ -289,106 +264,153 @@ def _random_initial(
         generator: Optional[torch.Generator] = None
     ) -> torch.Tensor:
     """
-    Initialize missing values (NaN) in CLR-transformed compositional data using random sampling.
-    This internal function handles the initialization of censored zero values by generating 
-    random values from a normal distribution and strategically assigning them to NaN positions.
-    
+    Replace NaN entries of CLR-transformed data by draws from the lower tail of a normal.
+
+    For each feature, sample_size normal variates are drawn with the feature mean and
+    standard deviation, the k smallest are retained as candidates, and one candidate is
+    drawn uniformly with replacement for each NaN of that feature. Here k is the number of
+    zeros of the feature, clamped to [1, sample_size].
+
     Parameters
     ----------
     y : torch.Tensor
-        Input tensor with shape (batch_size, feature_size) containing CLR-transformed data.
-        NaN values in this tensor represent censored zeros from the original data.
+        CLR-transformed data of shape (batch_size, feature_size). NaN entries mark the
+        censored zeros of the original data.
     sample_size : int
-        Number of random samples to generate per feature for selecting initialization values.
-        A larger sample size provides more candidates for initialization.
+        Number of normal variates drawn per feature.
     num_zero : torch.Tensor
-        Number of zeros per feature in the original data. Shape: (feature_size,)
+        Number of zeros per feature, of shape (feature_size,).
     mean : torch.Tensor
-        Estimated means for each feature in CLR space. Shape: (feature_size,)
+        Per-feature mean on the CLR scale, of shape (feature_size,).
     sd : torch.Tensor
-        Estimated standard deviations for each feature in CLR space. Shape: (feature_size,)
-    generator : Optional[torch.Generator], default=None
-        Pseudorandom number generator used by this function’s sampling steps.
-        If None, PyTorch’s global RNG state is used.
-    
+        Per-feature standard deviation on the CLR scale, of shape (feature_size,).
+    generator : torch.Generator, optional
+        Generator used for both random draws. If None, the global torch RNG is used.
+
     Returns
     -------
     torch.Tensor
-        A complete tensor of same shape as input 'y' where all NaN values have been 
-        replaced with appropriate random initializations.
-    
+        Tensor of the same shape as y with every NaN replaced.
+
     Notes
     -----
-    The function works in three main steps:
-    1. Generates random values from a normal distribution for each feature
-    2. Selects the smallest values as candidates for zero replacement
-    3. Randomly assigns these candidates to NaN positions in the data
+    Within a feature, the t-th NaN in ascending row order receives the t-th draw.
     """
     device, dtype = y.device, y.dtype
-    batch_size, feature_size = y.shape
-    
-    # Count number of NaN values (censored zeros) for each feature
-    nan_mask = torch.isnan(y)                                 # (n, d)
-    num_nan  = nan_mask.sum(dim=0)                            # (d,)
-    
-    # Nothing to fill
+    feature_size = y.shape[1]
+
+    nan_mask = torch.isnan(y)
+    num_nan = nan_mask.sum(dim=0)
+
     if (num_nan == 0).all():
         return y.clone()
-            
-    # Generate random samples from normal distribution using feature-specific parameters
-    # Shape: (sample_size, feature_size)
+
     rand = torch.randn(sample_size, feature_size, device=device, dtype=dtype, generator=generator)
-    random_data = rand * sd + mean
+    random_data = rand.mul_(sd).add_(mean)
 
-    # Sort ascending once per feature to get the "smallest" values quickly: (sample_size, feature_size)
-    vals_sorted, _ = torch.sort(random_data, dim=0)
-    
-    # How many smallest candidates to consider per feature:
-    # clamp to [1, sample_size]; if num_zero[j] == 0, still take at least 1 candidate
+    # Number of candidates kept per feature.
     k0 = num_zero.to(dtype=torch.long)
-    k = torch.clamp(torch.where(k0 > 0, k0, torch.ones_like(k0)), min=1, max=sample_size)  # (feature_size,)
+    k = torch.clamp(torch.where(k0 > 0, k0, torch.ones_like(k0)), min=1, max=sample_size)
     k_max = int(k.max().item())
-    
-    # Take the first k_max candidates per feature (others unused for columns with k_j < k_max)
-    candidates = vals_sorted[:k_max, :]                       # (k_max, feature_size)
-    
-    # We need m_j = num_nan[j] draws per feature, with replacement from [0 .. k_j-1].
-    m = num_nan.to(dtype=torch.long)                          # (feature_size,)
-    m_max = int(m.max().item())
-    
-    # Build a (m_max, d) matrix of indices ~ Uniform{0, …, k_j-1} using vector bounds:
-    # Use rand in [0,1), scale by k, floor, cast to long.
-    if m_max > 0:
-        r = (torch.rand(m_max, feature_size, device=device, generator=generator) * k.view(1, -1)).floor().to(torch.long)  # (m_max, feature_size)
-        # Gather chosen fills: (m_max, feature_size)
-        fills_full = torch.gather(candidates, dim=0, index=r)
+    candidates = torch.topk(random_data, k_max, dim=0, largest=False, sorted=True).values
+    del random_data, rand
+
+    # One uniform index in [0, k_j) per required draw of feature j.
+    m_max = int(num_nan.max().item())
+    r = (torch.rand(m_max, feature_size, device=device, generator=generator) * k.view(1, -1)).floor().to(torch.long)
+    fills_full = torch.gather(candidates, dim=0, index=r)
+
+    # Position of each NaN within its column, counted from the top.
+    rank = (nan_mask.cumsum(0) - 1).clamp_(0, m_max - 1)
+    picked = fills_full.gather(0, rank)
+
+    return torch.where(nan_mask, picked, y)
+
+def _epoch_index_batches(
+        n: int,
+        batch_size: int,
+        shuffle: bool,
+        generator: torch.Generator
+    ) -> List[tuple]:
+    """
+    Build one epoch of index batches, drawing from the generator as a DataLoader does.
+
+    Parameters
+    ----------
+    n : int
+        Number of samples.
+    batch_size : int
+        Number of indices per batch. The final batch may be shorter.
+    shuffle : bool
+        Whether the sample order is permuted.
+    generator : torch.Generator
+        Generator consumed by the draws.
+
+    Returns
+    -------
+    list of tuple
+        One ``(indices, None)`` pair per batch, with indices in permutation order.
+
+    Notes
+    -----
+    Each epoch consumes one int64 draw for the iterator base seed and, when shuffle is
+    True, two permutations of length n, matching torch 2.5 DataLoader with a RandomSampler.
+    """
+    torch.empty((), dtype=torch.int64).random_(generator=generator)
+    if shuffle:
+        perm = torch.randperm(n, generator=generator)
+        torch.randperm(n, generator=generator)
     else:
-        fills_full = torch.empty(0, feature_size, device=device, dtype=dtype)
+        perm = torch.arange(n)
+    return [(perm[s:s + batch_size], None) for s in range(0, n, batch_size)]
 
-    complete = y.clone()
-    
-    # Cheap per-column scatter into NaN positions (variable counts per column)
-    for j in range(feature_size):
-        mj = int(m[j].item())
-        if mj == 0:
-            continue
-        idx_nan_j = nan_mask[:, j].nonzero(as_tuple=False).squeeze(1)  # (mj,)
-        # take the first mj draws in column j
-        complete[idx_nan_j, j] = fills_full[:mj, j]
+_RANDPERM_BATCHING_OK: Optional[bool] = None
 
-    return complete
+def _randperm_batching_matches_dataloader() -> bool:
+    """
+    Check once per process that index batching reproduces the DataLoader.
+
+    Returns
+    -------
+    bool
+        True when the batch contents and the generator state after one epoch agree with
+        ``torch.utils.data.DataLoader`` on small reference cases.
+    """
+    global _RANDPERM_BATCHING_OK
+    if _RANDPERM_BATCHING_OK is not None:
+        return _RANDPERM_BATCHING_OK
+
+    ok = True
+    try:
+        for (n, bs, shuffle) in ((7, 3, True), (7, 3, False), (4, 4, True)):
+            ds = TensorDataset(torch.arange(n, dtype=torch.float64).view(n, 1))
+            g_ref = torch.Generator(device="cpu")
+            g_ref.manual_seed(1234)
+            dl = DataLoader(ds, batch_size=bs, shuffle=shuffle, num_workers=0,
+                            drop_last=False, generator=g_ref)
+            ref = [[tuple(b.view(-1).to(torch.long).tolist()) for (b,) in dl] for _ in range(2)]
+            ref_tail = torch.randn(2, generator=g_ref).tolist()
+
+            g_new = torch.Generator(device="cpu")
+            g_new.manual_seed(1234)
+            got = [[tuple(idx.tolist()) for (idx, _) in _epoch_index_batches(n, bs, shuffle, g_new)]
+                   for _ in range(2)]
+            got_tail = torch.randn(2, generator=g_new).tolist()
+
+            ok = ok and (ref == got) and (ref_tail == got_tail)
+    except Exception:
+        ok = False
+
+    _RANDPERM_BATCHING_OK = bool(ok)
+    return _RANDPERM_BATCHING_OK
 
 class MetVAE():
     """
-    Variational Autoencoder (VAE) specifically designed for untargeted metabolomics data analysis with covariate/confounder handling.
-    
-    This class implements a specialized VAE that accounts for the unique characteristics of metabolomics data,
-    including compositionality, zero values, and the influence of covariates/confounders. The model performs
-    several key preprocessing steps before training:
-    1. Centered log-ratio (CLR) transformation to handle compositional data
-    2. Careful handling of zero values through censored estimation and multiple imputation
-    3. Covariate/confounder adjustment to remove unwanted variation
-    
+    Variational autoencoder for untargeted metabolomics data with covariate adjustment.
+
+    On construction the input is centered-log-ratio transformed, zeros are recorded as
+    censored observations, and the measured covariates are regressed out on the CLR scale.
+
     Parameters
     ----------
     data : pd.DataFrame
@@ -397,8 +419,8 @@ class MetVAE():
     
     features_as_rows : bool, default=False
         Data orientation flag. Set to True if features (metabolites) are rows and samples are columns.
-        The model will transpose the data internally to maintain a consistent samples × features format.
-    
+        The model transposes the data internally to a samples by features layout.
+
     meta : pd.DataFrame, optional
         Sample metadata containing covariate/confounder information. Must have the same sample index as ``data``.
         Used to adjust for experimental and biological confounding factors.
@@ -416,9 +438,9 @@ class MetVAE():
         after preprocessing. Larger values allow more complex structure but require more data.
     
     hidden_dims : list[int] or None, default=None
-        Hidden layer sizes for the encoder (and, if applicable, decoder) MLP(s), e.g. ``[256, 128]``.
-        If ``None`` or an empty list, the encoder/decoder are linear (no hidden layers).
-    
+        Hidden layer sizes of the encoder networks, e.g. ``[256, 128]``.
+        If ``None`` or an empty list, the encoders are linear. The decoder is always linear.
+
     activation : str | callable | None, default="relu"
         Nonlinearity used in the MLP(s). One of ``{"relu", "tanh", "gelu", "silu"}``, ``None`` for identity,
         or a zero-argument callable returning an ``nn.Module`` (e.g., ``lambda: nn.LeakyReLU(0.1)``).
@@ -494,15 +516,16 @@ class MetVAE():
     
     train_loss : list[float]
         Per-epoch training losses recorded during ``train()``.
-    
-    Notes
-    -----
-    The model performs several important preprocessing steps automatically:
-    - CLR transformation to handle the compositional nature of metabolomics data.
-    - Zero-value handling via a censored-normal strategy with deterministic or stochastic imputation.
-    - Covariate/confounder adjustment to remove unwanted technical/biological variation.
-    - Optional logging for monitoring training progress and convergence.
-    
+
+    optimizer : torch.optim.Optimizer or None
+        Optimizer created by the most recent call to ``train()``.
+
+    scheduler : torch.optim.lr_scheduler.LRScheduler or None
+        Learning rate scheduler created by the most recent call to ``train()``.
+
+    current_epoch : int
+        Index of the epoch most recently completed by ``train()``; 0 before training.
+
     Examples
     --------
     >>> # Basic usage without covariates
@@ -535,17 +558,8 @@ class MetVAE():
             seed: int = 0
     ):
         """
-        Initialize the MetVAE model with data preprocessing and model setup.
-        
-        This initialization process includes:
-        1. Data preprocessing (CLR transformation, zero handling)
-        2. Covariate/confounder processing and adjustment
-        3. GPU/CPU device selection
-        4. Model architecture setup
+        Preprocess the data, select the device, and build the VAE.
         """
-        # Preprocess input data using internal utility function
-        
-        # Device
         self.device = torch.device("cuda") if (use_gpu and torch.cuda.is_available()) else torch.device("cpu")
         if use_gpu and not torch.cuda.is_available():
             print("CUDA not available. Falling back to CPU.")
@@ -598,9 +612,12 @@ class MetVAE():
             dtype=dtype
         ).to(self.device)
         
-        # Initialize placeholder for results
+        # Placeholders filled by get_corr and train.
         self.corr_outputs = None
         self.train_loss = []
+        self.optimizer = None
+        self.scheduler = None
+        self.current_epoch = 0
 
     def train(
             self,
@@ -614,192 +631,186 @@ class MetVAE():
             **trainer_kwargs
     ):
         """
-        Train the VAE model using mini-batch optimization.
-        
-        This method implements the full training loop for the VAE, including handling of zero values,
-        gradient updates, and learning rate scheduling. The training process uses mini-batch
-        stochastic gradient descent with the AdamW optimizer and cosine annealing learning rate
-        scheduling for improved convergence.
-        
+        Train the VAE by mini-batch stochastic gradient descent.
+
+        The optimizer is AdamW with zero weight decay and the learning rate follows a
+        cosine annealing schedule with warm restarts (T_0 = 20, T_mult = 2,
+        eta_min = learning_rate / 2). Batches containing censored zeros are completed by
+        ``_random_initial`` before the loss is evaluated.
+
         Parameters
         ----------
-        batch_size : int, default=32
-            Number of samples per mini-batch. Larger batches provide more stable gradients
-            but require more memory. Recommended range: 16-128 depending on available memory.
-            
+        batch_size : int, default=128
+            Number of samples per mini-batch.
         num_workers : int, default=0
-            Number of subprocesses to use for data loading. Set to 0 for the main process.
-            
+            Number of data loading subprocesses. Zero loads batches in the main process.
         max_epochs : int, default=1000
-            Maximum number of complete passes through the training data. The actual training
-            might converge earlier depending on loss progression.
-            
+            Number of passes through the training data.
         learning_rate : float, default=1e-3
-            Initial learning rate for the AdamW optimizer. The rate will be modulated by
-            the cosine annealing scheduler during training.
-            
+            Initial learning rate of the optimizer.
         max_grad_norm : float, default=1.0
-            Maximum norm for gradient clipping. Helps prevent exploding gradients and
-            stabilizes training. Set to None to disable gradient clipping.
-            
+            Maximum gradient norm used for clipping. None disables clipping.
         shuffle : bool, default=True
-            Whether to randomize the order in which data samples are loaded in each epoch.
-            
+            Whether the sample order is permuted at each epoch.
         deterministic : bool, default=False
-            If True and running on CUDA, enables deterministic kernels:
-            sets ``CUBLAS_WORKSPACE_CONFIG``, disables cuDNN benchmarking, enables
-            deterministic algorithms. This may reduce speed and can raise if a
-            non-deterministic op is encountered.
-            
+            If True and running on CUDA, sets ``CUBLAS_WORKSPACE_CONFIG``, disables cuDNN
+            benchmarking, and enables deterministic algorithms.
         **trainer_kwargs : dict
-            Additional keyword arguments for customizing the training process.
-        
-        Notes
-        -----
-        The training process includes several key components:
-        1. Mini-batch data loading with optional parallel processing
-        2. Zero-value handling through random initialization
-        3. Gradient-based optimization with AdamW
-        4. Learning rate scheduling with cosine annealing
-        5. Optional TensorBoard logging for monitoring training progress
-        
-        The method stores training losses in self.train_loss for later analysis.
+            Ignored. Passing any value raises a UserWarning.
+
+        Returns
+        -------
+        None
+            Per-epoch mean losses are appended to ``self.train_loss``.
+
+        Raises
+        ------
+        RuntimeError
+            If ``self.logging`` is True and tensorboard is not installed.
         """
-        # Reproducibility setup
+        if trainer_kwargs:
+            warnings.warn(
+                "train() ignores the extra keyword arguments "
+                f"{sorted(trainer_kwargs)}.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         run_seed = int(self.base_seed)
-        
-        # Global seeds
+
         torch.manual_seed(run_seed)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(run_seed)
-           
-        # Optional deterministic kernels (CUDA)
+
         if deterministic and self.device.type == "cuda":
             os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True)
-            
-        # DataLoader shuffle generator
+
         dl_gen = torch.Generator(device="cpu")
         dl_gen.manual_seed(run_seed)
-        
-        # Seed each worker for NumPy/Python as well
+
         def _worker_init_fn(worker_id: int):
             wseed = run_seed + worker_id
             random.seed(wseed)
             np.random.seed(wseed)
             torch.manual_seed(wseed)
-        
-        # Extract required data components from the class instance
+
         y_data = self.clr_data
         n = self.sample_dim
 
-        # Set up data loading with mini-batches
-        ds = TensorDataset(y_data)
-        pin_memory_flag = (y_data.device.type == "cpu" and self.device.type == "cuda")
-        dl = DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory_flag,
-            drop_last=False,
-            generator=dl_gen,                  
-            worker_init_fn=_worker_init_fn if num_workers > 0 else None,  
-            persistent_workers=(num_workers > 0)
-        )
+        has_zero = bool(torch.any(self.num_zero != 0))
+        rows_with_nan = torch.isnan(y_data).any(dim=1)
 
-        # Initialize optimizer and learning rate scheduler
-        # AdamW combines Adam optimizer with decoupled weight decay
-        optim = torch.optim.AdamW(self.model.parameters(),
-                                  lr=learning_rate, 
-                                  weight_decay=0.0)
-        
-        # Configure cosine annealing scheduler with warm restarts
-        # This helps escape local minima and find better solutions
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optim, 
-            T_0=20, # Initial restart period
-            T_mult=2, # Period multiplier after each restart
-            eta_min=learning_rate/2 # Minimum learning rate
+        # Index batching reproduces the DataLoader draws; fall back if it does not.
+        use_index_batching = (num_workers == 0) and _randperm_batching_matches_dataloader()
+        dl = None
+        if not use_index_batching:
+            ds = TensorDataset(y_data)
+            pin_memory_flag = (y_data.device.type == "cpu" and self.device.type == "cuda")
+            dl = DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=pin_memory_flag,
+                drop_last=False,
+                generator=dl_gen,
+                worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+                persistent_workers=(num_workers > 0)
             )
 
-        # Set up TensorBoard logging if enabled
+        optim = torch.optim.AdamW(self.model.parameters(),
+                                  lr=learning_rate,
+                                  weight_decay=0.0)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optim,
+            T_0=20,
+            T_mult=2,
+            eta_min=learning_rate/2
+            )
+
+        self.train_loss = []
+        self.optimizer = optim
+        self.scheduler = scheduler
+
         writer = None
         if self.logging:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError as exc:
+                raise RuntimeError(
+                    "logging=True requires tensorboard. Install it with `pip install tensorboard`."
+                ) from exc
             os.makedirs("runs", exist_ok=True)
             existing = [d for d in os.listdir("runs") if d.startswith("run") and d[len("run"):].isdigit()]
             next_id = max([int(d[len("run"):]) for d in existing], default=-1) + 1
             writer = SummaryWriter(os.path.join("runs", f"run{next_id}"))
-        
-        # Begin training loop
-        self.model.train()
-        for epoch in tqdm(range(1, max_epochs + 1)):
-            running = 0.0
-            num_batches = 0
 
-            for (y_batch,) in dl:
-                # y_batch: (batch_size, d)
-                # Impute NaNs if any (and only if original data had zeros)
-                if torch.any(self.num_zero != 0) and torch.isnan(y_batch).any():
-                    complete_y = _random_initial(
-                        y=y_batch,
-                        sample_size=n,                
-                        num_zero=self.num_zero,
-                        mean=self.clr_mean,
-                        sd=self.clr_sd,
-                    )
+        try:
+            self.model.train()
+            for epoch in tqdm(range(1, max_epochs + 1)):
+                running = torch.zeros((), dtype=torch.float64, device=self.device)
+                num_batches = 0
+
+                if use_index_batching:
+                    batches = _epoch_index_batches(n, batch_size, shuffle, dl_gen)
                 else:
-                    complete_y = y_batch
+                    batches = ((None, y_batch) for (y_batch,) in dl)
 
-                loss = self.model.training_step(complete_y)  
+                for idx, y_batch in batches:
+                    if idx is not None:
+                        y_batch = y_data[idx]
+                        batch_has_nan = bool(rows_with_nan[idx].any())
+                    else:
+                        batch_has_nan = bool(torch.isnan(y_batch).any())
 
-                optim.zero_grad(set_to_none=True)
-                loss.backward()
-                if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
-                optim.step()
+                    if has_zero and batch_has_nan:
+                        complete_y = _random_initial(
+                            y=y_batch,
+                            sample_size=n,
+                            num_zero=self.num_zero,
+                            mean=self.clr_mean,
+                            sd=self.clr_sd,
+                        )
+                    else:
+                        complete_y = y_batch
 
-                running += float(loss.item())
-                num_batches += 1
+                    loss = self.model.training_step(complete_y)
 
-            # epoch end
-            if num_batches > 0:
-                avg = running / num_batches
-                self.train_loss.append(avg)
-                if writer is not None:
-                    writer.add_scalar("Loss/train", avg, epoch)
+                    optim.zero_grad(set_to_none=True)
+                    loss.backward()
+                    if max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
+                    optim.step()
 
-            scheduler.step()
-        
-        # Ensure all logging data is written
-        if self.logging:
-            writer.flush()
+                    running += loss.detach()
+                    num_batches += 1
+
+                if num_batches > 0:
+                    avg = running.item() / num_batches
+                    self.train_loss.append(avg)
+                    if writer is not None:
+                        writer.add_scalar("Loss/train", avg, epoch)
+
+                scheduler.step()
+                self.current_epoch = epoch
+        finally:
+            if writer is not None:
+                writer.flush()
+                writer.close()
 
     def confound_coef(self):
         """
-        Extract and format the learned covariate/confounder coefficients from the model.
-        
-        This method retrieves the coefficients that describe how each covariate/confounder affects
-        the metabolite abundances in the CLR-transformed space. These coefficients help
-        us understand the strength and direction of confounding effects on each metabolite.
-        
+        Return the estimated covariate coefficients on the CLR scale.
+
         Returns
         -------
-        pd.DataFrame or None
-            If metadata was provided during training:
-                Returns a DataFrame where rows are metabolites, columns are covariates,
-                and values represent the effect size of each covariate on each metabolite.
-            If no metadata was provided:
-                Returns None since no confounding effects were modeled.
-        
-        Notes
-        -----
-        Positive coefficients indicate that increasing the covariate/confounder value leads to
-        higher metabolite abundance, while negative coefficients indicate the opposite.
-        The coefficients are in the CLR space, so interpretations should consider
-        the compositional nature of the data.
+        pandas.DataFrame or None
+            Coefficients with features as rows and covariates as columns, or None when no
+            metadata was supplied.
         """
         if self.meta is not None:
             clr_coef = self.clr_coef.clone().detach().cpu()
@@ -814,31 +825,13 @@ class MetVAE():
 
     def confound_es(self):
         """
-        Calculate the total confounding effect size for each sample and metabolite.
-        
-        This method computes the combined effect of all covariates on each metabolite
-        for each sample by multiplying the covariate values with their corresponding
-        coefficients. This shows us how much of each metabolite's variation can be
-        attributed to the measured confounding factors.
-        
+        Return the fitted covariate effect for each sample and feature on the CLR scale.
+
         Returns
         -------
-        pd.DataFrame or None
-            If metadata was provided during training:
-                Returns a DataFrame where rows are samples, columns are metabolites,
-                and values represent the total confounding effect on each metabolite
-                in each sample.
-            If no metadata was provided:
-                Returns None since no confounding effects were modeled.
-        
-        Notes
-        -----
-        The effect sizes are in the CLR space and represent how much each metabolite's
-        abundance would be expected to change based solely on the confounding factors.
-        This can be useful for:
-        - Identifying samples with strong confounding effects
-        - Understanding which metabolites are most affected by confounders
-        - Validating the effectiveness of confounder adjustment
+        pandas.DataFrame or None
+            Product of the covariate matrix and the coefficients, with samples as rows and
+            features as columns, or None when no metadata was supplied.
         """
         if self.meta is not None:
             clr_coef = self.confound_coef().values
@@ -859,57 +852,56 @@ class MetVAE():
             generator: Optional[torch.Generator] = None
     ) -> torch.Tensor:
         """
-        Impute censored zeros (NaNs on the CLR/log scale) in the preprocessed data.
-    
-        This routine fills missing entries in ``self.clr_data`` using a two-stage approach:
-        1) **Censored-normal initialization:** draw low-tail values per feature from a
-           Gaussian parameterized by ``clr_mean`` and ``clr_sd``, respecting each
-           feature's zero frequency (via ``_random_initial``).
-        2) **VAE refinement:** run the trained VAE in eval mode
-           on the initialized matrix and use the reconstruction to replace only the
-           originally missing entries.
-    
-        If no zeros were detected during preprocessing (i.e., no NaNs in ``self.clr_data``),
-        the input is returned unchanged.
-    
+        Impute the censored zeros of the preprocessed CLR data.
+
+        Missing entries of ``self.clr_data`` are first drawn from the lower tail of a
+        per-feature normal by ``_random_initial``, then replaced by the reconstruction of
+        the VAE evaluated on the completed matrix. Observed entries are left unchanged.
+        If no zeros were detected during preprocessing, ``self.clr_data`` is returned.
+
+        Parameters
+        ----------
+        generator : torch.Generator, optional
+            Generator used by the initialization and by the latent sampling. If None, the
+            global torch RNG is used.
+
         Returns
         -------
         torch.Tensor
-            Dense tensor of shape ``(n_samples, n_features)`` on the CLR/log scale,
-            same device/dtype as the inputs. Observed entries are preserved; NaNs are
-            replaced by VAE-refined values.
+            Dense tensor of shape (n_samples, n_features) on the CLR scale, with the same
+            device and dtype as ``self.clr_data``.
         """
-        # Extract required components
         y = self.clr_data
         num_zero = self.num_zero
         clr_mean = self.clr_mean
         clr_sd = self.clr_sd
         n, d = y.shape
-    
+
+        was_training = self.model.training
         self.model.eval()
-        if torch.any(num_zero != 0):
-            # Step 1: Initialize missing values with random samples
-            complete_y = _random_initial(
-                y=y, 
-                sample_size=n, 
-                num_zero=num_zero, 
-                mean=clr_mean, 
-                sd=clr_sd,
-                generator=generator)
-            
-            # Step 2: Use the VAE to refine the initial estimates
-            with torch.no_grad():
-                _, _, _, recon_y = self.model(
-                    complete_y,
-                    generator=generator
-                )
-            
-            # Step 3: Combine original and imputed values
-            impute_y = y.clone()
-            impute_y[torch.isnan(y)] = recon_y[torch.isnan(y)]
-        else:
-            impute_y = y
-    
+        try:
+            if torch.any(num_zero != 0):
+                nan_mask = torch.isnan(y)
+                complete_y = _random_initial(
+                    y=y,
+                    sample_size=n,
+                    num_zero=num_zero,
+                    mean=clr_mean,
+                    sd=clr_sd,
+                    generator=generator)
+
+                with torch.no_grad():
+                    _, _, _, recon_y = self.model(
+                        complete_y,
+                        generator=generator
+                    )
+
+                impute_y = torch.where(nan_mask, recon_y, y)
+            else:
+                impute_y = y
+        finally:
+            self.model.train(was_training)
+
         return impute_y
     
     @torch.no_grad()
@@ -921,30 +913,42 @@ class MetVAE():
         device: torch.device
     ) -> tuple:
         """
-        Single imputation round using a per-call RNG (works on CPU/GPU, stream-safe).
+        Run one imputation and its correlation estimate with a per-call generator.
+
+        Parameters
+        ----------
+        seed : int
+            Seed of the generator used by this simulation.
+        shift : torch.Tensor
+            Per-sample offset added to the CLR data to return to the log scale.
+        threshold : float
+            Absolute correlation cutoff.
+        device : torch.device
+            Device of the generator and of the computation.
+
+        Returns
+        -------
+        impute_log_data : torch.Tensor
+            Imputed data on the log scale, of shape (n, d).
+        corr : torch.Tensor
+            Dense correlation matrix of shape (d, d).
         """
-        # Per-call generator; no global reseeding
         gen = torch.Generator(device=device)
         gen.manual_seed(int(seed))
-    
-        # If on CUDA, ensure we run on the intended device (esp. multi-GPU)
+
         if device.type == "cuda":
             with torch.cuda.device(device):
                 impute_clr_data = self.impute_zeros(generator=gen)
         else:
             impute_clr_data = self.impute_zeros(generator=gen)
-    
-        # Back to log/original scales
+
         impute_log_data = impute_clr_data + shift
-        impute_data = torch.exp(impute_log_data)
-    
-        # Sparse correlation
-        sparse_corr = _compute_correlation(data=impute_data, threshold=threshold)
-        return impute_log_data, sparse_corr
-    
+        corr = _compute_correlation_dense(torch.exp(impute_log_data), threshold=threshold)
+        return impute_log_data, corr
+
     def _gpu_parallel_imputation(
-        self, 
-        num_sim: int, 
+        self,
+        num_sim: int,
         shift: torch.Tensor,
         threshold: float,
         batch_size: int,
@@ -952,204 +956,156 @@ class MetVAE():
         base_seed: int = 0
     ) -> tuple:
         """
-        GPU-optimized parallel imputation using batching and streams.
+        Average multiple imputations and their correlation estimates on CUDA.
+
+        Parameters
+        ----------
+        num_sim : int
+            Number of simulations.
+        shift : torch.Tensor
+            Per-sample offset added to the CLR data to return to the log scale.
+        threshold : float
+            Absolute correlation cutoff applied within each simulation.
+        batch_size : int
+            Number of simulations issued per round of CUDA streams.
+        device : torch.device
+            CUDA device used for the computation.
+        base_seed : int, default=0
+            Seed of simulation ``sim_id`` is ``base_seed + sim_id``.
+
+        Returns
+        -------
+        impute_log_data_mean : torch.Tensor
+            Mean imputed data on the log scale, of shape (n, d).
+        Rn_mean_sparse : torch.Tensor
+            Sparse COO mean correlation matrix of shape (d, d).
+
+        Raises
+        ------
+        ValueError
+            If num_sim < 1.
         """
-        n_features = self.feature_dim
-        accumulated_indices, accumulated_values = [], []
-        impute_log_sum = None
-    
         if num_sim < 1:
             raise ValueError("num_sim must be >= 1")
         num_batches = (num_sim + batch_size - 1) // batch_size
-    
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_sim)
-            current_batch_size = end_idx - start_idx
-    
-            batch_sparse_corrs, batch_impute_log = [], []
-            streams = [torch.cuda.Stream(device=device) for _ in range(min(4, current_batch_size))]
-    
-            for i in range(current_batch_size):
-                sim_id = start_idx + i
-                sim_seed = base_seed + sim_id
-                stream = streams[i % len(streams)]
-    
-                with torch.cuda.stream(stream):
-                    # NOTE: we don't reseed globals; _single_imputation builds a local Generator
-                    impute_log, sparse_corr = self._single_imputation(
-                        sim_seed, shift, threshold, device
-                    )
-                    batch_impute_log.append(impute_log)
-                    batch_sparse_corrs.append(sparse_corr)
-    
-            # Ensure kernels in this batch are complete
-            for s in streams:
-                s.synchronize()
-    
-            # Sum logs without keeping the whole stack (saves memory)
-            for impute_log in batch_impute_log:
-                impute_log_sum = impute_log.clone() if impute_log_sum is None else (impute_log_sum + impute_log)
-    
-            # Accumulate sparse pieces
-            for sc in batch_sparse_corrs:
-                idx = sc.indices()
-                val = sc.values() / float(num_sim)  # pre-divide for mean
-                accumulated_indices.append(idx)
-                accumulated_values.append(val)
-    
-            # Explicit cleanup
-            del batch_sparse_corrs, batch_impute_log
-            torch.cuda.empty_cache()
-    
-        # Mean of log data
+
+        acc = None
+        impute_log_sum = None
+
+        was_training = self.model.training
+        try:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_sim)
+                current_batch_size = end_idx - start_idx
+
+                batch_corrs, batch_impute_log = [], []
+                streams = [torch.cuda.Stream(device=device) for _ in range(min(4, current_batch_size))]
+
+                for i in range(current_batch_size):
+                    sim_id = start_idx + i
+                    stream = streams[i % len(streams)]
+
+                    with torch.cuda.stream(stream):
+                        impute_log, corr = self._single_imputation(
+                            base_seed + sim_id, shift, threshold, device
+                        )
+                        batch_impute_log.append(impute_log)
+                        batch_corrs.append(corr)
+
+                for s in streams:
+                    s.synchronize()
+
+                for impute_log in batch_impute_log:
+                    impute_log_sum = impute_log.clone() if impute_log_sum is None else (impute_log_sum + impute_log)
+
+                for corr in batch_corrs:
+                    acc = corr.clone() if acc is None else acc.add_(corr)
+
+                del batch_corrs, batch_impute_log
+        finally:
+            self.model.train(was_training)
+
         impute_log_data_mean = impute_log_sum / float(num_sim)
-    
-        # Build averaged sparse correlation
-        if accumulated_indices:
-            all_indices = torch.cat(accumulated_indices, dim=1)
-            all_values  = torch.cat(accumulated_values)
-    
-            Rn_mean_sparse = torch.sparse_coo_tensor(
-                indices=all_indices,
-                values=all_values,
-                size=(n_features, n_features),
-                device=device
-            ).coalesce()
-        else:
-            Rn_mean_sparse = torch.sparse_coo_tensor(
-                indices=torch.empty(2, 0, dtype=torch.long, device=device),
-                values=torch.empty(0, dtype=impute_log_data_mean.dtype, device=device),
-                size=(n_features, n_features),
-                device=device
-            )
-    
+        Rn_mean_sparse = (acc / float(num_sim)).to_sparse_coo()
+
         return impute_log_data_mean, Rn_mean_sparse
-    
-    def _cpu_parallel_imputation(
+
+    def _cpu_multiple_imputation(
             self,
             num_sim: int,
             shift: torch.Tensor,
             threshold: float,
-            workers: int,
-            device: torch.device,
+            workers: Optional[int],
             base_seed: int = 0
     ) -> tuple:
         """
-        Process-based parallel imputation with joblib (loky).
-        - Chunks simulations inside each worker to reduce IPC/memory.
-        - Returns (impute_log_data_mean, Rn_mean_sparse).
+        Average multiple imputations and their correlation estimates on CPU.
+
+        Simulations run sequentially inside a block that fixes the number of intra-op
+        torch threads, so the reduction order is the simulation order and the result does
+        not depend on ``workers``.
+
+        Parameters
+        ----------
+        num_sim : int
+            Number of simulations.
+        shift : torch.Tensor
+            Per-sample offset added to the CLR data to return to the log scale.
+        threshold : float
+            Absolute correlation cutoff applied within each simulation.
+        workers : int or None
+            Number of intra-op torch threads. None or a negative value uses all cores.
+        base_seed : int, default=0
+            Seed of simulation ``sim_id`` is ``base_seed + sim_id``.
+
+        Returns
+        -------
+        impute_log_data_mean : torch.Tensor
+            Mean imputed data on the log scale, of shape (n, d).
+        Rn_mean_sparse : torch.Tensor
+            Sparse COO mean correlation matrix of shape (d, d).
+
+        Raises
+        ------
+        ValueError
+            If num_sim < 1.
         """
-        if workers is None:
-            workers = 1
-        elif workers < 0:
-            workers = os.cpu_count() or 1
-        else:
-            workers = int(workers)
-    
         if num_sim < 1:
             raise ValueError("num_sim must be >= 1")
-    
-        # Limit BLAS oversubscription in each process (optional but healthy)
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-        try:
-            torch.set_num_threads(1)
-            torch.set_num_interop_threads(1)
-        except Exception:
-            pass
-    
-        # Decide chunking: ~equal-size chunks across workers
-        chunk_size = max(1, math.ceil(num_sim / max(1, workers)))
-            
-    
-        # Build seed ranges for each chunk
-        ranges = []
-        for start in range(0, num_sim, chunk_size):
-            end = min(start + chunk_size, num_sim)
-            ranges.append((start, end))
-    
-        # Worker function: run a chunk of simulations and aggregate locally
-        def _run_chunk(start: int, end: int):
-            impute_sum = None
-            idx_list, val_list = [], []
-            # Use CPU in worker processes
-            dev_cpu = torch.device("cpu")
-    
-            for sim_id in range(start, end):
-                seed = base_seed + sim_id
-                impute_log, sparse_corr = self._single_imputation(
-                    seed, shift, threshold, dev_cpu
-                )
-                impute_sum = impute_log.clone() if impute_sum is None else impute_sum + impute_log
-                idx_list.append(sparse_corr.indices())
-                val_list.append(sparse_corr.values())
-    
-            # Concatenate once per chunk (smaller memory than per-sim)
-            if idx_list:
-                chunk_indices = torch.cat(idx_list, dim=1)
-                chunk_values  = torch.cat(val_list)
-            else:
-                # Empty chunk (shouldn't happen if num_sim>0)
-                chunk_indices = torch.empty(2, 0, dtype=torch.long, device="cpu")
-                chunk_values  = torch.empty(0, device="cpu", dtype=impute_sum.dtype if impute_sum is not None else torch.float32)
-    
-            return impute_sum, chunk_indices, chunk_values
-    
-        # Parallel execution with processes; results are in input order
-        if workers == 1:
-            results = [_run_chunk(s, e) for (s, e) in ranges]
+
+        if workers is None or int(workers) < 0:
+            nthreads = os.cpu_count() or 1
         else:
-            with parallel_backend("loky"):  # explicit processes
-                # pre_dispatch limits how many tasks are queued simultaneously (reduces memory)
-                results = Parallel(
-                    n_jobs=workers,
-                    prefer="processes",
-                    pre_dispatch=workers,   # queue ~workers chunks at a time
-                    batch_size=1,           # 1 chunk per dispatched task
-                    verbose=0,
-                )(delayed(_run_chunk)(s, e) for (s, e) in ranges)
-    
-        # Reduce across chunks on the driver
-        impute_log_sum = None
-        all_indices, all_values = [], []
-        for chunk_sum, chunk_idx, chunk_val in results:
-            impute_log_sum = chunk_sum if impute_log_sum is None else impute_log_sum + chunk_sum
-            if chunk_idx.numel() > 0:
-                all_indices.append(chunk_idx)
-                all_values.append(chunk_val)
-    
-        # Mean imputation
-        impute_log_data_mean = impute_log_sum / float(num_sim)
-    
-        # Average sparse correlations
-        n_features = impute_log_data_mean.shape[-1]
-        if all_indices:
-            combined_indices = torch.cat(all_indices, dim=1)                 # (2, nnz_total)
-            combined_values  = torch.cat(all_values) / float(num_sim)        # (nnz_total,)
-    
-            # Canonical lexicographic order -> bit-stable coalesce
-            lin = combined_indices[0] * n_features + combined_indices[1]
-            perm = torch.argsort(lin)
-            combined_indices = combined_indices[:, perm]
-            combined_values  = combined_values[perm]
-    
-            Rn_mean_sparse = torch.sparse_coo_tensor(
-                indices=combined_indices,
-                values=combined_values,
-                size=(n_features, n_features),
-                device="cpu",
-            ).coalesce()
-        else:
-            Rn_mean_sparse = torch.sparse_coo_tensor(
-                indices=torch.empty(2, 0, dtype=torch.long, device="cpu"),
-                values=torch.empty(0, device="cpu"),
-                size=(n_features, n_features),
-                device="cpu",
-            )
-    
-        return impute_log_data_mean, Rn_mean_sparse
-    
+            nthreads = max(1, int(workers))
+
+        d = self.feature_dim
+        dtype, device = self.clr_data.dtype, self.clr_data.device
+
+        was_training = self.model.training
+        with _thread_limit(nthreads), torch.no_grad():
+            try:
+                acc = torch.zeros((d, d), dtype=dtype, device=device)
+                G = torch.empty((d, d), dtype=dtype, device=device)
+                T = torch.empty((d, d), dtype=dtype, device=device)
+                ilog = None
+
+                for sim_id in range(num_sim):
+                    gen = torch.Generator(device="cpu")
+                    gen.manual_seed(base_seed + sim_id)
+                    il = self.impute_zeros(generator=gen) + shift
+                    _compute_correlation_dense(torch.exp(il), threshold=threshold, out=G, scratch=T)
+                    acc.add_(G)
+                    if ilog is None:
+                        ilog = il
+                    else:
+                        ilog.add_(il)
+            finally:
+                self.model.train(was_training)
+
+        del G, T
+        return ilog / num_sim, (acc / num_sim).to_sparse_coo()
+
     def get_corr(
         self,
         num_sim: int = 100,
@@ -1159,79 +1115,62 @@ class MetVAE():
         seed: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute a correlation estimate from multiple imputations, optionally in parallel,
-        and cache the result in ``self.corr_outputs``.
-    
-        The method performs multiple stochastic imputations of the (log) data, averages
-        the imputed matrices, transforms back to the original scale, and computes a
-        **sparse** correlation matrix by hard-thresholding small correlations.
-    
+        Estimate the correlation matrix from multiple imputations and cache the result.
+
+        Each simulation imputes the censored zeros, returns to the log scale, computes the
+        correlation matrix, and hard-thresholds it. The reported estimate is the mean of
+        the thresholded matrices, and ``impute_log_data`` is the mean of the imputed log
+        data.
+
         Parameters
         ----------
         num_sim : int, default=100
             Number of imputation simulations to run and average.
-            Larger values reduce Monte Carlo noise but increase time/memory.
-    
+
         workers : int, default=-1
-            CPU thread count for the **CPU** path (ignored on GPU).
-            - ``-1`` uses all available CPU cores.
-            - ``1`` runs sequentially (deterministic order).
-            - ``>1`` uses a thread pool (shared memory; faster but see Notes on
-              reproducibility).
-    
+            Number of intra-op torch threads used by the CPU path; ``-1`` uses all cores.
+            The thread count is restored on return and the result does not depend on it.
+            Ignored on CUDA.
+
         batch_size : int, default=100
-            Batch size for the **GPU** path. Controls how many imputations are
-            executed per batch/round of CUDA streams. Increase to use more GPU,
-            decrease to reduce peak memory.
-    
+            Number of simulations issued per round of CUDA streams on the GPU path.
+
         threshold : float, default=0.2
-            Absolute correlation cutoff used inside ``_compute_correlation``.
-            Only entries with ``|r| >= threshold`` are kept; the result is returned
-            as a sparse COO tensor (symmetric; diagonal kept).
-    
+            Absolute correlation cutoff applied within each simulation. Entries with
+            ``|r| < threshold`` are set to zero before averaging.
+
         seed : int or None, default=None
-            Base seed for reproducibility. When provided, each simulation uses
-            ``seed + sim_id`` as its per-simulation seed. See Notes for details.
-    
+            Base seed. Simulation ``sim_id`` uses ``seed + sim_id``. If None, the seed
+            given to the constructor is used.
+
         Returns
         -------
-        outputs : Dict[str, torch.Tensor]
-            A dictionary with:
-            - ``'impute_log_data'`` : ``torch.Tensor`` (dense, shape ~ ``(n, p)``)
-                The mean of imputed log-scale data over ``num_sim`` simulations.
-            - ``'estimate'`` : ``torch.Tensor`` (sparse COO, shape ``(p, p)``)
-                Sparse correlation estimate obtained after thresholding.
-                Convert with ``.to_dense()`` if a dense matrix is needed.
+        dict
+            Dictionary with ``'impute_log_data'``, a dense tensor of shape (n, d), and
+            ``'estimate'``, a sparse COO tensor of shape (d, d).
         """
-        
-        # Get required components from the model
         shift = self.shift
         num_zero = self.num_zero
         device = self.device
-        
+
         base_seed = int(seed) if seed is not None else self.base_seed
-        
-        # Check if we need to handle zeros
+
         if torch.any(num_zero != 0):
             if device.type == 'cuda':
-                # GPU implementation
                 impute_log_data_mean, Rn_mean = self._gpu_parallel_imputation(
                     num_sim, shift, threshold, batch_size, device, base_seed=base_seed
                 )
             else:
-                # CPU implementation
-                impute_log_data_mean, Rn_mean = self._cpu_parallel_imputation(
-                    num_sim, shift, threshold, workers, device, base_seed=base_seed
+                impute_log_data_mean, Rn_mean = self._cpu_multiple_imputation(
+                    num_sim, shift, threshold, workers, base_seed=base_seed
                 )
         else:
-            # Direct computation without imputation
             impute_clr_data = self.impute_zeros()
             impute_log_data_mean = impute_clr_data + shift
             impute_data = torch.exp(impute_log_data_mean)
             Rn_mean = _compute_correlation(data=impute_data,
                                            threshold=threshold)
-        
-        # Store outputs
+
         outputs = {
             'impute_log_data': impute_log_data_mean,
             'estimate': Rn_mean
@@ -1249,83 +1188,60 @@ class MetVAE():
             cutoff: float = 0.05
     ):
         """
-        Create a sparse correlation matrix by filtering based on statistical significance.
-        
-        This method implements Fisher's z-test to identify significant 
-        correlations between metabolites while controlling for multiple testing. It follows 
-        a three-step process:
-        
-        1. Transform correlation coefficients using Fisher's z-transformation to obtain
-           normally distributed values that can be used for statistical testing.
-           
-        2. Calculate p-values using the transformed correlations and sample size, which
-           tells us the probability of observing such correlations by chance.
-           
-        3. Adjust these p-values for multiple testing to control the false discovery rate
-           or family-wise error rate, depending on the chosen method.
-        
+        Sparsify the correlation estimate by a Fisher z-test with multiplicity control.
+
+        The correlations are clamped to (-1, 1), transformed by
+        z = 0.5 * (log1p(r) - log1p(-r)), divided by the standard error 1 / sqrt(n - 3),
+        converted to two-sided normal p-values, and adjusted for multiple testing.
+        Correlations whose adjusted p-value exceeds the cutoff are set to zero.
+
         Parameters
         ----------
         p_adj_method : str, default='fdr_bh'
-            Method for multiple testing correction. Options include:
-            - 'fdr_bh': Benjamini-Hochberg FDR control (recommended for most cases)
-            - 'bonferroni': Most conservative, controls family-wise error rate
-            - 'holm': Less conservative than Bonferroni but still controls FWER
-            - Other methods provide different tradeoffs between power and error control
-        
+            Multiple testing correction passed to ``_matrix_p_adjust``.
         cutoff : float, default=0.05
-            Significance threshold for adjusted p-values. Correlations with adjusted
-            p-values above this threshold will be set to zero in the sparse network.
-        
+            Adjusted p-value threshold.
+
         Returns
         -------
         dict
-            A dictionary containing:
-            - 'estimate': Original correlation matrix
-            - 'p_value': Unadjusted p-values for each correlation
-            - 'q_value': Adjusted p-values after multiple testing correction
-            - 'sparse_estimate': Sparsified correlation matrix where non-significant
-               correlations are set to zero
+            Dictionary with ``'estimate'``, ``'p_value'``, ``'q_value'`` and
+            ``'sparse_estimate'``, each a dense (d, d) float64 pandas.DataFrame indexed by
+            feature name. All four matrices are held in memory simultaneously.
+
+        Raises
+        ------
+        ValueError
+            If ``get_corr`` has not been called, or if the sample size is not greater
+            than 3.
         """
-        # Check if correlations have been computed
         if self.corr_outputs is None:
             raise ValueError("No correlation estimates. Please compute correlations the first using get_corr method.")
         if getattr(self, "sample_dim", None) is None or self.sample_dim <= 3:
             raise ValueError("Sample size must be > 3 for Fisher's z-test.")
-        
-        # Extract preprocessed data and correlation estimate
+
         Rn = self.corr_outputs['estimate']
         n = self.sample_dim
         feature_names = self.feature_name
-        
-        # Convert to regular matrix
-        Rn = Rn.to_dense()
-        Rn = Rn.clamp(min=-1.0 + 1e-7, max=1.0 - 1e-7)
+
+        Rn = Rn.to_dense() if Rn.is_sparse else Rn.clone()
+        Rn.clamp_(min=-1.0 + 1e-7, max=1.0 - 1e-7)
         Rn.fill_diagonal_(1.0)
         device, dtype = Rn.device, Rn.dtype
 
-        # Step 1: Fisher's z-transformation of correlations
-        # This transforms correlation coefficients to approximate normal distribution
-        # z = 0.5 * log((1+Rn)/(1-Rn)) = 0.5 * (log1p(Rn) - log1p(-Rn))
         z = 0.5 * (torch.log1p(Rn) - torch.log1p(-Rn))
-        
-        # Calculate standard error of the z-transformed correlations
         se = 1.0 / torch.sqrt(torch.tensor(float(n-3), dtype=dtype, device=device))
-        
-        # Calculate z-scores for hypothesis testing
         z_score = z / se
+        del z
         z_score.fill_diagonal_(0.0)
-        
-        # Step 2: Calculate two-tailed p-values
-        p_val = 2.0 * (1.0 - torch.special.ndtr(torch.abs(z_score)))
-        p_val.fill_diagonal_(0.0)
-        
-        # Step 3: Apply multiple testing correction
-        q_val = _matrix_p_adjust(p_val, method=p_adj_method)
 
-        # Create sparse correlation matrix by filtering based on adjusted p-values
+        p_val = 2.0 * (1.0 - torch.special.ndtr(torch.abs(z_score)))
+        del z_score
+        p_val.fill_diagonal_(0.0)
+
+        q_val = _matrix_p_adjust(p_val, method=p_adj_method)
         Rn_hat = _p_filter(Rn, q_val, max_p = cutoff, impute_value = 0)
-        
+
         outputs = {
             'estimate' : _torch_to_df(Rn, names=feature_names),
             'p_value' : _torch_to_df(p_val, names=feature_names),
@@ -1358,28 +1274,19 @@ class MetVAE():
         refine_points: int = 10     # number of points in the refined bracket (inclusive)
     ):
         """
-        Create a sparse correlation matrix using the Sparse Estimation of Correlation (SEC) algorithm.
-    
-        This method can:
-        - run a **single SEC fit** when a fixed `rho` (penalty) is supplied, or
-        - **automatically select `rho` via K-fold cross-validation (CV)** when `rho` is None.
-    
-        Automatic selection evaluates candidates `rho = c * sqrt(log(p)/n)` for `c` in `c_grid`.
-        After a coarse pass over `c_grid`, if `refine=True` a **single refinement** zooms into
-        the interval between the best coarse `c` and its immediate neighbors, evaluating an
-        evenly spaced finer grid of size `refine_points`. The final `best_rho` minimizes the
-        mean validation Frobenius error across folds (ties favor smaller `rho`).
-    
-        Parallelism:
-        - **CPU** with `workers=-1` (default) or `workers>1`: evaluate candidate `rho`s in parallel.
-        - **GPU** or `workers<=1`: evaluate sequentially.
-    
+        Sparsify the correlation estimate with the sparse estimation of correlation algorithm.
+
+        A fixed `rho` runs a single fit. When `rho` is None it is selected by K-fold
+        cross-validation over the candidates `rho = c * sqrt(log(p)/n)` for `c` in `c_grid`,
+        scored by the mean validation squared Frobenius error, with ties resolved in favor of
+        the smaller `rho`. With `refine=True` a single further pass evaluates
+        `refine_points` evenly spaced values between the neighbors of the best coarse `c`.
+
         Parameters
         ----------
         rho : float, optional
-            Fixed ℓ₁ regularization parameter for SEC. If provided, runs one SEC fit.
-            If None (default), `rho` is selected by K-fold CV with an optional single refinement.
-    
+            Fixed L1 penalty. If None, selected by cross-validation.
+
         epsilon : float, default=1e-5
             Eigenvalue floor for PSD projection during calibration.
     
@@ -1451,41 +1358,39 @@ class MetVAE():
     
         Notes
         -----
-        - CV scoring uses mean squared Frobenius error between the SEC fit (train folds)
-          and the empirical correlation on validation folds.
-        - The refinement reuses the same folds and cached validation correlations.
-        - Sparse (COO) tensors are densified internally where required.
+        Cross-validation scores the mean squared Frobenius error between the fit on the
+        training folds and the empirical correlation on the validation fold. The refinement
+        reuses the same folds and the cached validation correlations. The returned
+        DataFrames hold two dense d by d float64 matrices.
         """
-        # Prechecks
         if self.corr_outputs is None:
             raise ValueError("No correlation estimates. Please compute correlations first using `get_corr`.")
-    
-        # Extract preprocessed data and correlation estimate
+
         impute_log_data = self.corr_outputs['impute_log_data']
         Rn = self.corr_outputs['estimate']
         feature_names = self.feature_name
-        impute_data = torch.exp(impute_log_data)  # stays on same device/dtype
+        impute_data = torch.exp(impute_log_data)
         n = self.sample_dim
-    
+
+        Rn_dense = Rn.to_dense() if Rn.is_sparse else Rn
+
         best_rho = None
         scores_by_rho = None
         R_hat_dense = None
-    
+
         if rho is not None:
-            # --- fixed-ρ single fit ---
-            R_hat_sparse = _SEC(
-                Rn=Rn, rho=rho,
+            R_hat_dense = _SEC_dense(
+                Rn=Rn_dense, rho=rho,
                 epsilon=epsilon, tol=tol, max_iter=max_iter, restart=restart,
                 line_search_apg=line_search_apg, delta=delta, n_samples=n,
                 c_delta=c_delta, threshold=threshold
             )
-            R_hat_dense = R_hat_sparse.to_dense()
             best_rho = rho
             scores_by_rho = None
         else:
             best_rho, scores_by_rho, R_hat_dense = _SEC_cv(
                 X=impute_data,
-                Rn=Rn,                         
+                Rn=Rn_dense,
                 c_grid=c_grid,
                 n_splits=n_splits,
                 seed=seed if seed is not None else self.base_seed,
@@ -1496,9 +1401,7 @@ class MetVAE():
                 line_search_apg=line_search_apg, delta=delta, n_samples=n,
                 c_delta=c_delta, threshold=threshold
             )
-    
-        # Prepare outputs (dense DataFrames)
-        Rn_dense = Rn.to_dense()
+
         outputs = {
             'estimate': _torch_to_df(Rn_dense, names=feature_names),
             'sparse_estimate': _torch_to_df(R_hat_dense, names=feature_names),
@@ -1515,27 +1418,31 @@ class MetVAE():
         file_prefix: str = "correlation_graph_cutoff",
     ):
         """
-        Take a sparse correlation matrix and write
-        one GraphML file per cutoff.
-    
+        Build one undirected graph per absolute correlation cutoff, optionally as GraphML.
+
         Parameters
         ----------
         sparse_df : pandas.DataFrame
-            Final sparse correlation estimate (e.g. ``filt["sparse_estimate"]``).
-    
-        cutoffs : Iterable[float]
-            Absolute correlation cutoffs, e.g. ``[0.9, 0.8, 0.7, ...]``.
-    
-        output_dir : Optional[str], default=None
-            Directory where the ``.graphml`` files will be written.
-    
+            Square correlation matrix, typically ``sparse_by_p()["sparse_estimate"]``.
+        cutoffs : iterable of float
+            Absolute correlation cutoffs. Non-positive values are dropped.
+        output_dir : str, optional
+            Directory receiving the ``.graphml`` files. If None, nothing is written.
         file_prefix : str, default="correlation_graph_cutoff"
-            Prefix used for filenames; the numeric cutoff and the ``.graphml``
-            extension are appended automatically.
+            Filename prefix; the cutoff and the ``.graphml`` extension are appended.
+
         Returns
         -------
-        graphs : Dict[float, nx.Graph]
-            One undirected graph per cutoff (only for cutoffs that yielded ≥1 edge).
+        dict
+            Mapping from ``f"Correlation_cutoff{cutoff:g}"`` to ``networkx.Graph``,
+            containing only the cutoffs that yielded at least one edge.
+
+        Raises
+        ------
+        RuntimeError
+            If networkx is not installed.
+        ValueError
+            If sparse_df is not a pandas.DataFrame.
         """
         try:
             import networkx as nx
@@ -1547,44 +1454,51 @@ class MetVAE():
         if sparse_df is None or not isinstance(sparse_df, pd.DataFrame):
             raise ValueError("sparse_df must be a pandas DataFrame with the sparse correlation matrix.")
 
-        # Long-format edge list using your helper (expects columns: node1, node2, correlation)
-        df_long = _corr_to_long(sparse_df)
-
-        # Normalize/sort cutoffs (largest first)
         cutoffs = sorted({float(c) for c in cutoffs if float(c) > 0.0}, reverse=True)
 
         graphs: Dict[str, nx.Graph] = {}
+        if not cutoffs:
+            return graphs
 
-        # Create output dir only if saving is requested
+        # Strict upper triangle of the matrix as an edge list, keeping only usable edges.
+        names = [str(x) for x in sparse_df.index]
+        values = sparse_df.to_numpy()
+        iu, ju = np.triu_indices(values.shape[0], k=1)
+        corr = values[iu, ju].astype(float, copy=False)
+        keep = ~np.isnan(corr)
+        keep &= np.abs(corr) >= min(cutoffs)
+        kept = [float(v) for v in corr[keep]]
+        df_long = pd.DataFrame({
+            "node1": [names[i] for i in iu[keep]],
+            "node2": [names[j] for j in ju[keep]],
+            "correlation": pd.Series(kept, dtype=object),
+            "abs_corr": np.abs(corr[keep]),
+        })
+
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
 
         for cutoff in cutoffs:
             edge_type = f"Correlation_cutoff{cutoff:g}"
-            sub = df_long.loc[df_long["correlation"].abs() >= cutoff]
+            sub = df_long.loc[df_long["abs_corr"] >= cutoff].copy()
 
             if sub.empty:
-                continue  # nothing to build/save for this cutoff
+                continue
 
-            # Build graph
-            G = nx.Graph()
-            for row in sub.itertuples(index=False):
-                u = str(row.node1)
-                v = str(row.node2)
-                c = float(row.correlation)
-                G.add_edge(
-                    u,
-                    v,
-                    weight=c,
-                    correlation=c,
-                    EdgeScore=c,
-                    EdgeType=edge_type,
-                    id=edge_type,
-                )
+            sub["weight"] = sub["correlation"]
+            sub["EdgeScore"] = sub["correlation"]
+            sub["EdgeType"] = edge_type
+            sub["id"] = edge_type
+            G = nx.from_pandas_edgelist(
+                sub,
+                source="node1",
+                target="node2",
+                edge_attr=["weight", "correlation", "EdgeScore", "EdgeType", "id"],
+                create_using=nx.Graph,
+            )
 
             graphs[edge_type] = G
 
-            # Save only if requested
             if output_dir is not None:
                 filename = f"{file_prefix}{cutoff:g}.graphml"
                 path = os.path.join(output_dir, filename)
@@ -1594,16 +1508,13 @@ class MetVAE():
     
     def clr_loading(self):
         """
-        Extract and format the VAE's learned feature loadings in CLR space.
-        
+        Return the decoder weight matrix as feature loadings on the CLR scale.
+
         Returns
         -------
         pandas.DataFrame
-            A DataFrame where:
-            - Rows represent metabolites (features)
-            - Columns represent latent dimensions
-            - Values indicate how strongly each metabolite contributes to each dimension
-            - Column names are formatted as "latent_0", "latent_1", etc.
+            Loadings with features as rows and latent dimensions as columns, the latter
+            named ``latent_0``, ``latent_1``, and so on.
         """
         clr_loading = self.model.decode_mu.weight.clone().detach().cpu().numpy()
         clr_loading = pd.DataFrame(
@@ -1615,18 +1526,14 @@ class MetVAE():
 
     def cooccurrence(self):
         """
-        Calculate the co-occurrence strength between metabolites based on their latent representations.
-        
-        This method transforms the VAE's learned feature loadings into co-occrrence measures, represented as the variances of log-ratios.
-        
+        Return the model-implied variance of pairwise log ratios between features.
+
         Returns
         -------
         pandas.DataFrame
-            A symmetric DataFrame where both rows and columns are metabolites.
-            Each value represents the co-occurrence strength between two metabolites:
-            - Higher values indicate metabolites that vary more independently
-            - Lower values suggest metabolites that tend to change together
-            - The diagonal represents self-co-occurrence (usually not meaningful)
+            Symmetric matrix indexed by feature name, equal to the squared Euclidean
+            distances between the feature loadings scaled by (n - 1) / n. Larger values
+            indicate features that vary more independently.
         """
         clr_loading = self.clr_loading().values
         cooccur = squareform(pdist(clr_loading)) ** 2 * (self.sample_dim - 1) / self.sample_dim
@@ -1694,8 +1601,7 @@ def _simple_inference(
         
         impute_log_data = impute_clr_data + shift
         impute_data = torch.exp(impute_log_data)
-        rho_k = _compute_correlation(data=impute_data, threshold=threshold)
-        rho_k = rho_k.to_dense()
+        rho_k = _compute_correlation_dense(data=impute_data, threshold=threshold)
         
         impute_log_sum += torch.nan_to_num(impute_log_data, nan=0.0).to(dtype)
         Rn_sum += torch.nan_to_num(rho_k, nan=0.0).to(dtype)
@@ -1706,9 +1612,9 @@ def _simple_inference(
     Rn = (Rn_sum / float(num_sim)).to(dtype)
 
     if sparse_method == 'pval':
-        # Obtain p-values by Fisher z-transformation
+        # Fisher z-transformation of the correlations.
         Rn_clamped = Rn.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-        z = 0.5 * (torch.log1p(Rn_clamped) - torch.log1p(-Rn_clamped))  # 0.5*log((1+ρ)/(1-ρ))
+        z = 0.5 * (torch.log1p(Rn_clamped) - torch.log1p(-Rn_clamped))
         
         se = 1.0 / torch.sqrt(torch.tensor(float(n - 3), device=device, dtype=Rn.dtype))
         z_score = z / se
@@ -1721,12 +1627,9 @@ def _simple_inference(
         
         Rn_hat = _p_filter(Rn, q_value, max_p=cutoff, impute_value=0)
     else:
-        Rn_hat = _SEC(
-            Rn=Rn,
-            rho=rho
-        )
-        
-    Rn_hat_dense = Rn_hat.to_dense()
+        Rn_hat = _SEC_dense(Rn=Rn, rho=rho)
+
+    Rn_hat_dense = Rn_hat
 
     # Outputs
     outputs = {

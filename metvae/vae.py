@@ -1,6 +1,6 @@
+import math
 import torch
 import torch.nn as nn
-import torch.distributions as dists
 from typing import Optional, List, Tuple, Callable, Union
 
 def _get_activation(name: Optional[Union[str, Callable[[], nn.Module]]]) -> nn.Module:
@@ -31,41 +31,40 @@ def _mlp(in_dim: int, hidden_dims: Optional[List[int]], out_dim: int,
 
 class VAE(nn.Module):
     """
-    VAE with optional MLP nonlinearities.
-    
+    Variational autoencoder with a linear decoder and optional MLP encoders.
+
+    The latent prior is standard normal and the latent posterior is sampled with the
+    reparameterization trick.
+
     Parameters
     ----------
     input_dim : int
         Dimensionality of the input data.
     latent_dim : int
-        Size of the latent representation (number of latent variables).
-    hidden_dims : list[int] or None, optional (default=None)
-        Sequence of hidden layer sizes for the encoder and decoder.
-        If None or an empty list, the encoder and decoder are simple linear mappings.
-    activation : str or callable or None, optional (default="relu")
-        Nonlinear activation to use between hidden layers.
-        Can be a string ("relu", "tanh", "gelu", "silu") or a callable that returns an nn.Module.
-        If None, no activation is applied (purely linear encoder/decoder).
-    dtype : torch.dtype, optional (default=torch.float64)
-        Data type for all model parameters and layers (e.g., torch.float32 or torch.float64).
+        Size of the latent representation.
+    hidden_dims : list of int or None, default=None
+        Hidden layer sizes of the two encoder networks. If None or empty, the encoders
+        are single linear layers. The decoder is a single linear layer in all cases.
+    activation : str or callable or None, default="relu"
+        Nonlinearity between encoder hidden layers. One of "relu", "tanh", "gelu",
+        "silu", None for identity, or a zero-argument callable returning an nn.Module.
+    dtype : torch.dtype, default=torch.float64
+        Data type of all parameters and layers.
 
     Attributes
     ----------
     encnorm : nn.LayerNorm
-        Layer normalization applied to input features before encoding.
-    encode_mu : nn.Module
-        Encoder network mapping input features to the latent mean vector μ.
-    encode_rho : nn.Module
-        Encoder network mapping input features to the latent log-scale parameter ρ,
-        used to compute the latent standard deviation σ = softplus(ρ).
+        Layer normalization applied to the input before encoding.
+    encode_mu : nn.Sequential
+        Encoder network returning the latent mean.
+    encode_rho : nn.Sequential
+        Encoder network returning the latent log-scale, from which the latent standard
+        deviation is softplus(rho) + 1e-4.
     decode_mu : nn.Linear
-        Decoder network mapping latent variables back to reconstructed inputs.
+        Linear decoder returning the reconstruction mean.
     decode_rho : nn.Parameter
-        Learnable log-scale parameter controlling the global reconstruction variance
-        (shared across all input dimensions).
-
-    The model uses the reparameterization trick for the variational inference and employs a standard Gaussian
-    prior over the latent variables.
+        Scalar log-scale of the reconstruction standard deviation, shared across all
+        input dimensions.
     """
     def __init__(
             self, 
@@ -99,19 +98,21 @@ class VAE(nn.Module):
             generator: Optional[torch.Generator] = None
     ) -> torch.Tensor:
         """
-        Reparameterization trick to sample from the latent space.
+        Draw a latent sample with the reparameterization trick.
 
-        Parameters:
+        Parameters
         ----------
-        mu : torch.Tensor, (batch_size, latent_dim)
-            Mean of the latent space distribution.
-        std : torch.Tensor, (batch_size, latent_dim)
-            Standard deviation of the latent space distribution.
+        mu : torch.Tensor
+            Latent mean of shape (batch_size, latent_dim).
+        std : torch.Tensor
+            Latent standard deviation of shape (batch_size, latent_dim).
+        generator : torch.Generator, optional
+            Generator used for the normal draw. If None, the global torch RNG is used.
 
-        Returns:
+        Returns
         -------
-        z : torch.Tensor, (batch_size, latent_dim)
-            Sampled tensor from the latent space distribution.
+        torch.Tensor
+            Latent sample of shape (batch_size, latent_dim).
         """
         eps = torch.randn(std.shape, device=std.device, dtype=std.dtype, generator=generator)
         z = mu + eps * std
@@ -119,19 +120,20 @@ class VAE(nn.Module):
 
     def encode(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode the input features into latent space representations.
+        Encode the input features into latent mean and standard deviation.
 
-        Parameters:
+        Parameters
         ----------
-        y : torch.Tensor, (batch_size, input_dim)
-            Input tensor, usually the residuals after removing the effects of confounders.
+        y : torch.Tensor
+            Input of shape (batch_size, input_dim), typically the residuals after
+            covariate adjustment.
 
-        Returns:
+        Returns
         -------
-        mu : torch.Tensor, (batch_size, latent_dim)
-            Mean of the latent space distribution.
-        std : torch.Tensor, (batch_size, latent_dim)
-            Standard deviation of the latent space distribution.
+        mu : torch.Tensor
+            Latent mean of shape (batch_size, latent_dim).
+        std : torch.Tensor
+            Latent standard deviation of shape (batch_size, latent_dim).
         """
         y = self.encnorm(y)
         mu = self.encode_mu(y)
@@ -141,17 +143,17 @@ class VAE(nn.Module):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Decode the latent space representation back into the input space.
+        Decode a latent sample back into the input space.
 
-        Parameters:
+        Parameters
         ----------
-        z : torch.Tensor, (batch_size, latent_dim)
-            Latent space representation.
+        z : torch.Tensor
+            Latent sample of shape (batch_size, latent_dim).
 
-        Returns:
+        Returns
         -------
-        y : torch.Tensor, (batch_size, input_dim)
-            Decoded tensor representing the original input features (reconstruction).
+        torch.Tensor
+            Reconstruction of shape (batch_size, input_dim).
         """
         y = self.decode_mu(z)
         return y
@@ -168,21 +170,40 @@ class VAE(nn.Module):
         return mu, encode_std, z, recon_y
 
     def training_step(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the negative evidence lower bound averaged over the batch.
+
+        Parameters
+        ----------
+        y : torch.Tensor
+            Input of shape (batch_size, input_dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss equal to -mean(recon_ll + neg_kl), where recon_ll is the Gaussian
+            reconstruction log-likelihood summed over features and neg_kl is the negative
+            Kullback-Leibler divergence from the standard normal prior to the latent
+            posterior, summed over latent dimensions.
+        """
         mu, encode_std, z, recon_y = self(y)
-        encode_std = torch.clamp(encode_std, 
-                                 min=1e-3, 
+        encode_std = torch.clamp(encode_std,
+                                 min=1e-3,
                                  max=10.0)
         encode_logvar = 2.0 * torch.log(encode_std)
-        
+
         decode_std = nn.functional.softplus(self.decode_rho) + 1e-4
-        decode_std = torch.clamp(decode_std, 
-                                 min=1e-3, 
+        decode_std = torch.clamp(decode_std,
+                                 min=1e-3,
                                  max=10.0)
 
-        # ELBO
-        recon_ll = dists.Normal(loc=recon_y, scale=decode_std).log_prob(y).sum(dim=-1)
-        kl = 0.5 * (1 + encode_logvar - mu.pow(2) - encode_logvar.exp()).sum(dim=-1)
-        elbo = recon_ll + kl 
+        # Gaussian log-density written in closed form; expand so the gradient w.r.t.
+        # decode_rho reduces over the same axes as a broadcast Normal log_prob.
+        s = decode_std.expand(recon_y.shape)
+        var = s ** 2
+        recon_ll = (-((y - recon_y) ** 2) / (2 * var) - s.log() - math.log(math.sqrt(2 * math.pi))).sum(dim=-1)
+        neg_kl = 0.5 * (1 + encode_logvar - mu.pow(2) - encode_logvar.exp()).sum(dim=-1)
+        elbo = recon_ll + neg_kl
         loss = -elbo.mean()
-        
+
         return loss

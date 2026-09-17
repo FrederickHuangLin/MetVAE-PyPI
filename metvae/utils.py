@@ -1,3 +1,5 @@
+import contextlib
+import os
 from typing import Optional, Sequence
 import numpy as np
 import pandas as pd
@@ -71,8 +73,12 @@ def _corr_to_long(
         mask = np.tril(np.ones((p, p), dtype=bool), k=-1)
 
     df_masked = df_cor.where(mask)
-    # stack() automatically drops NaNs (i.e., the masked-out entries)
-    df_long = df_masked.stack().reset_index()
+    # future_stack keeps NaNs, so the masked-out entries are dropped explicitly.
+    try:
+        stacked = df_masked.stack(future_stack=True)
+    except TypeError:
+        stacked = df_masked.stack()
+    df_long = stacked.dropna().reset_index()
     df_long.columns = ["node1", "node2", "correlation"]
 
     if sort_by_abs:
@@ -86,3 +92,24 @@ def _corr_to_long(
 
 
 
+
+
+@contextlib.contextmanager
+def _thread_limit(num_threads: Optional[int]):
+    """
+    Temporarily set the number of intra-op torch threads.
+
+    Parameters
+    ----------
+    num_threads : int or None
+        Thread count to use inside the block. None or a value below 1 means
+        all available cores. The previous setting is restored on exit.
+    """
+    previous = torch.get_num_threads()
+    if num_threads is None or int(num_threads) < 1:
+        num_threads = os.cpu_count() or 1
+    try:
+        torch.set_num_threads(int(num_threads))
+        yield
+    finally:
+        torch.set_num_threads(previous)
