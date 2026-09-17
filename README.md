@@ -9,6 +9,7 @@ MetVAE can be used from Python or from the command line through `metvae-cli`.
 - [Installation](#installation)
 - [Preparing your data](#preparing-your-data)
 - [A complete example](#a-complete-example)
+- [Example notebooks](#example-notebooks)
 - [Arguments that matter](#arguments-that-matter)
 - [Reading the results](#reading-the-results)
 - [Reproducibility](#reproducibility)
@@ -199,6 +200,10 @@ Best rho: 1.2746360114795632
 followed by the first five rows and columns of the sparsified correlation matrix.
 
 In this example no metabolite is dropped, because each one has exactly 30 percent zeros and the default filter removes metabolites with a zero proportion strictly greater than 0.30.
+
+## Example notebooks
+
+The `notebooks/` folder holds three executed Jupyter notebooks: `01_quickstart.ipynb` (the example above with figures and a timing table), `02_sim_study.ipynb` (four simulated settings with and without confounders and zero inflation), and `03_hcc.ipynb` (a real 411 sample by 7217 metabolite data set analyzed from a saved checkpoint). The data and checkpoint they read are not part of this repository; the notebooks document the file paths and the exact calls.
 
 ## Arguments that matter
 
@@ -613,15 +618,16 @@ To use a fixed penalty instead of cross-validation, add `--rho 2.2`. In that cas
 
 ## Citation
 
-If you use MetVAE, please cite the MetVAE paper and the SEC method.
+If you use MetVAE, please cite the protocol preprint and the SEC method. The protocol manuscript is under review at STAR Protocols.
 
 ```bibtex
-@article{metvae,
-  title   = {Variational Autoencoders for Metabolomics: Data Imputation, Deconfounding, and Correlation Discovery},
-  author  = {<to be completed>},
-  journal = {<to be completed>},
-  year    = {<to be completed>},
-  doi     = {<to be completed>}
+@article{lin2026metvae,
+  title   = {Protocol for constructing correlation-based molecular networks from large-scale untargeted metabolomics data},
+  author  = {Lin, Huang and Zhang, Lijun and Lotfi, Ali and Jarmusch, Alan and Lee, Iris and Kim, Adam and Morton, James T. and Aksenov, Alexander},
+  journal = {bioRxiv},
+  year    = {2026},
+  doi     = {10.1101/2025.04.26.649581},
+  note    = {PMCID: PMC13131467. Under review at STAR Protocols.}
 }
 
 @article{cui2016sec,
@@ -634,7 +640,7 @@ If you use MetVAE, please cite the MetVAE paper and the SEC method.
 }
 ```
 
-The SEC implementation in this package is adapted from the MATLAB reference code released by Leng's group at the University of Warwick.
+The preprint is available at https://pmc.ncbi.nlm.nih.gov/articles/PMC13131467/. The SEC implementation in this package is adapted from the MATLAB reference code released by Leng's group at the University of Warwick.
 
 ## License
 

@@ -65,3 +65,6 @@ docs/_build/
 # Distribution
 *.tar.gz
 *.whl
+
+# Outputs written by the example notebooks
+notebooks/results/
