@@ -203,7 +203,13 @@ In this example no metabolite is dropped, because each one has exactly 30 percen
 
 ## Example notebooks
 
-The `notebooks/` folder holds three executed Jupyter notebooks: `01_quickstart.ipynb` (the example above with figures and a timing table), `02_sim_study.ipynb` (four simulated settings with and without confounders and zero inflation), and `03_hcc.ipynb` (a real 411 sample by 7217 metabolite data set analyzed from a saved checkpoint). The data and checkpoint they read are not part of this repository; the notebooks document the file paths and the exact calls.
+The `notebooks/` folder holds three executed Jupyter notebooks.
+
+- `01_quickstart.ipynb`: the example above, with the training loss curve, a comparison against the simulated truth, and a timing table.
+- `02_sim_study.ipynb`: four simulated settings, with and without confounders and with and without zero inflation, each analyzed with both sparsification methods.
+- `03_hcc.ipynb`: a real data set with 411 samples and 7217 metabolites analyzed from a saved checkpoint. The data and the checkpoint are not distributed with the package; the cells that read them are kept as comments with their original outputs, and the notebook states where the data can be downloaded.
+
+The first two notebooks run without any additional files.
 
 ## Arguments that matter
 
@@ -618,7 +624,7 @@ To use a fixed penalty instead of cross-validation, add `--rho 2.2`. In that cas
 
 ## Citation
 
-If you use MetVAE, please cite the protocol preprint and the SEC method. The protocol manuscript is under review at STAR Protocols.
+If you use MetVAE, please cite the protocol preprint. The manuscript is under review at STAR Protocols.
 
 ```bibtex
 @article{lin2026metvae,
@@ -629,18 +635,11 @@ If you use MetVAE, please cite the protocol preprint and the SEC method. The pro
   doi     = {10.1101/2025.04.26.649581},
   note    = {PMCID: PMC13131467. Under review at STAR Protocols.}
 }
-
-@article{cui2016sec,
-  title   = {Sparse estimation of high-dimensional correlation matrices},
-  author  = {Cui, Ying and Leng, Chenlei and Sun, Defeng},
-  journal = {Computational Statistics and Data Analysis},
-  volume  = {93},
-  pages   = {390--403},
-  year    = {2016}
-}
 ```
 
-The preprint is available at https://pmc.ncbi.nlm.nih.gov/articles/PMC13131467/. The SEC implementation in this package is adapted from the MATLAB reference code released by Leng's group at the University of Warwick.
+The preprint is available at https://pmc.ncbi.nlm.nih.gov/articles/PMC13131467/.
+
+The SEC implementation in this package is adapted from the MATLAB reference code released by Leng's group at the University of Warwick, which accompanies Cui, Leng and Sun (2016), Computational Statistics and Data Analysis 93, 390-403, https://doi.org/10.1016/j.csda.2014.10.001.
 
 ## License
 
